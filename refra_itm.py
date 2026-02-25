@@ -1,5 +1,24 @@
+"""
+refra_itm.py
+============
+Seismic refraction analysis using the Intercept-Time Method (ITM).
+
+Workflow
+--------
+1. Read first-arrival picks from .vs files grouped by transect.
+2. For each shot, split the spread into left / right wings and fit a
+   two-segment linear travel-time curve (V1 = direct wave, V2 = refracted).
+3. Derive depth-to-refractor from the intercept-time formula.
+4. Export results to:
+   - PDF  : travel-time plots  (refra_itm_traveltimes.pdf)
+   - PDF  : elevation + rock-depth profiles  (refra_itm_elevation.pdf)
+   - XLSX : tabular summary  (refra_itm_results.xlsx)
+"""
+
+import csv
 import sys
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -8,59 +27,550 @@ import matplotlib.pyplot as plt
 import matplotlib.backends.backend_pdf as pdf_backend
 from scipy.stats import linregress
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 # ---------------------------------------------------------------------------
-# Site-specific plausibility bounds (m/s)
+# Configuration
 # ---------------------------------------------------------------------------
-V1_MIN, V1_MAX = 150,  800
-V2_MIN, V2_MAX = 800, 3000
-V2_ROCK_MIN    = 800   # m/s – depth point only kept if v2 >= this
+V1_MIN: float = 150.0
+V1_MAX: float = 800.0
+V2_MIN: float = 800.0
+V2_MAX: float = 3000.0
+V2_ROCK_MIN: float = 800.0
+
+BP_SLOPE_TOLERANCE: float = 1.20
+MIN_SEGMENT_POINTS: int = 3
+
+# Elevation plot axis limits – 1:1 aspect is enforced by set_aspect('equal').
+# x: 0 → 28 m  (28 m range)
+# y: -15 → +7 m (22 m range)  — clipped at -15 for readability
+ELEV_X_MIN: float =  0.0
+ELEV_X_MAX: float = 28.0
+ELEV_Y_MIN: float = -15.0
+ELEV_Y_MAX: float =  7.0
+
+SHEET_PILE_DEPTH: float = 18.0  # m below surface
+
+# Geotech style
+_DPL_COLOR:        str = 'darkorange'
+_CPTU_COLOR:       str = 'royalblue'
+_ROCK_MARKER_SIZE: int = 7
+_SHEET_PILE_COLOR: str = 'black'
+
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
+WingResult = Optional[dict]
+ShotResult = dict
 
 
-# ---------------------------------------------------------------------------
-# Elevation helpers
-# ---------------------------------------------------------------------------
-def read_elevation_file(elev_path: Path):
-    distances  = []
-    elevations = []
-    with open(elev_path, 'r') as fh:
-        for line in fh:
-            parts = line.strip().split()
-            if len(parts) < 2:
+# ===========================================================================
+# Elevation data  (read from elev.csv)
+# ===========================================================================
+
+def read_elev_csv(csv_path: Path) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    """
+    Parse elev.csv into per-transect (distances, elevations) arrays.
+
+    Relevant columns
+    ----------------
+    line_no         : transect id  (e.g. '0220' or '220')
+    dist_first_gp_m : raw distance along transect (m)
+    geop_id         : integer geophone id; the row where geop_id == 0
+                      defines x = 0 on the plot axis.  All other x values
+                      are shifted by the same offset so that the geop_id==0
+                      row lands exactly at x = 0.
+    z               : elevation (m ASL)
+
+    Rows with x < ELEV_X_MIN or x > ELEV_X_MAX are kept so that
+    np.interp can extrapolate (clamp) the surface elevation at the
+    plot boundaries when needed.
+
+    Returns
+    -------
+    dict  transect_id → (dist_array, elev_array)  sorted by x
+    """
+    # raw storage: tid → list of (raw_dist, geop_id_or_None, z)
+    raw: dict[int, list[tuple[float, Optional[float], float]]] = {}
+
+    if not csv_path.exists():
+        print(f"  ⚠  elev.csv not found at {csv_path} – no elevation data.")
+        return {}
+
+    with open(csv_path, newline='', encoding='utf-8-sig') as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            raw_line = row.get('line_no', '').strip()
+            if not raw_line:
                 continue
             try:
-                distances.append(float(parts[0]))
-                elevations.append(float(parts[1]))
+                tid = int(raw_line)
             except ValueError:
                 continue
-    return np.array(distances), np.array(elevations)
+
+            dist = _parse_float(row.get('dist_first_gp_m', ''))
+            z    = _parse_float(row.get('z', ''))
+            if dist is None or z is None:
+                continue
+
+            geop_id = _parse_float(row.get('geop_id', ''))
+            raw.setdefault(tid, []).append((dist, geop_id, z))
+
+    result: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    for tid, pts in raw.items():
+        # Find the raw dist value for the row where geop_id == 0
+        ref_dist: Optional[float] = None
+        for dist, geop_id, _ in pts:
+            if geop_id is not None and geop_id == 0.0:
+                ref_dist = dist
+                break
+
+        if ref_dist is None:
+            print(f"  ⚠  Transect {tid}: no geop_id==0 row found in "
+                  f"elev.csv – using raw distances unchanged.")
+            ref_dist = 0.0
+
+        # Apply shift so that geop_id==0 lands at x=0
+        shifted = sorted(
+            [(dist - ref_dist, z) for dist, _, z in pts],
+            key=lambda p: p[0],
+        )
+
+        result[tid] = (
+            np.array([p[0] for p in shifted]),
+            np.array([p[1] for p in shifted]),
+        )
+
+        x_min_data = result[tid][0].min()
+        x_max_data = result[tid][0].max()
+        print(f"  Transect {tid}: {len(shifted)} elevation points, "
+              f"x = {x_min_data:.1f} … {x_max_data:.1f} m "
+              f"(ref shift = {-ref_dist:+.2f} m)")
+
+    print(f"  elev.csv: elevation data loaded for "
+          f"{len(result)} transect(s).")
+    return result
 
 
-def find_elevation_file(elev_dir: Path, transect_id: int) -> Optional[Path]:
-    for name in (f"elev_{transect_id:04d}.txt", f"elev_{transect_id}.txt"):
-        p = elev_dir / name
-        if p.exists():
-            return p
-    return None
+# ===========================================================================
+# Geotech data
+# ===========================================================================
 
+@dataclass
+class GeotechPoint:
+    """One row from geotech.csv that carries an actual test result."""
+    test_type:     str
+    line_no:       int
+    dist_x:        float           # dist_first_gp_m → x-axis (m)
+    tested_depth:  float           # m below surface
+    depth_of_rock: Optional[float] # m below surface, or None
+
+
+@dataclass
+class SheetPileLine:
+    """Position of the planned sheet-pile wall for one transect."""
+    line_no: int
+    dist_x:  float  # dist_first_gp_m where dist_sheet_pile_m == 0
+
+
+def _parse_float(value: str) -> Optional[float]:
+    """Return float or None for blank / non-numeric CSV cells."""
+    v = value.strip()
+    if not v:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+
+def read_geotech_csv(csv_path: Path
+                     ) -> tuple[dict[int, list[GeotechPoint]],
+                                dict[int, SheetPileLine]]:
+    """
+    Parse geotech.csv.
+
+    Returns
+    -------
+    geotech_by_tid   : transect_id → list[GeotechPoint]
+    sheetpile_by_tid : transect_id → SheetPileLine
+    """
+    geotech:   dict[int, list[GeotechPoint]] = {}
+    sheetpile: dict[int, SheetPileLine]      = {}
+
+    if not csv_path.exists():
+        print(f"  ⚠  geotech.csv not found at {csv_path} – skipping.")
+        return geotech, sheetpile
+
+    with open(csv_path, newline='', encoding='utf-8-sig') as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            raw_line = row.get('line_no', '').strip()
+            if not raw_line:
+                continue
+            try:
+                tid = int(raw_line)
+            except ValueError:
+                continue
+
+            dist_sheet = _parse_float(row.get('dist_sheet_pile_m', ''))
+            dist_x     = _parse_float(row.get('dist_first_gp_m', ''))
+            if dist_x is None:
+                continue
+
+            # Sheet-pile reference (dist_sheet_pile_m == 0)
+            if dist_sheet is not None and dist_sheet == 0.0:
+                if tid not in sheetpile:
+                    sheetpile[tid] = SheetPileLine(line_no=tid, dist_x=dist_x)
+
+            # Actual test row
+            test_type = row.get('test_type', '').strip()
+            if not test_type:
+                continue
+
+            tested = _parse_float(row.get('tested_depth_m', ''))
+            rock   = _parse_float(row.get('depth_of_rock_m', ''))
+            if tested is None:
+                continue
+
+            geotech.setdefault(tid, []).append(GeotechPoint(
+                test_type     = test_type,
+                line_no       = tid,
+                dist_x        = dist_x,
+                tested_depth  = tested,
+                depth_of_rock = rock,
+            ))
+
+    print(f"  Geotech CSV: {sum(len(v) for v in geotech.values())} tests "
+          f"across {len(geotech)} transect(s); "
+          f"{len(sheetpile)} sheet-pile position(s) loaded.")
+    return geotech, sheetpile
+
+
+# ===========================================================================
+# I/O helpers
+# ===========================================================================
+
+def read_vs_file(file_path: Path) -> tuple[Optional[float],
+                                           np.ndarray, np.ndarray]:
+    """
+    Parse one .vs pick file.
+
+    Lines
+    -----
+    1-2  : header (ignored)
+    3    : shot position in column 0
+    4-27 : geophone_distance  travel_time_ms  [weight]
+    """
+    shot_pos:  Optional[float] = None
+    distances: list[float] = []
+    times_ms:  list[float] = []
+
+    with open(file_path, 'r') as fh:
+        for line_num, line in enumerate(fh, start=1):
+            row = line.strip().split()
+            if line_num < 3:
+                continue
+            if line_num == 3:
+                shot_pos = float(row[0])
+                continue
+            if line_num > 27:
+                break
+            if len(row) >= 2:
+                try:
+                    distances.append(float(row[0]))
+                    times_ms.append(float(row[1]))
+                except ValueError:
+                    print(f"  Warning: non-numeric data on line {line_num} "
+                          f"of {file_path.name} – skipped.")
+
+    return shot_pos, np.array(distances), np.array(times_ms)
+
+
+def group_by_transect(vs_files: list[Path]) -> dict[int, list[Path]]:
+    """Group .vs files by transect id from filenames ``<tid>-<sid>.vs``."""
+    pattern = re.compile(r'^(\d+)-(\d+)\.vs$', re.IGNORECASE)
+    groups: dict[int, list[Path]] = {}
+    for path in vs_files:
+        m = pattern.match(path.name)
+        if not m:
+            print(f"  Skipping unrecognised filename: {path.name}")
+            continue
+        groups.setdefault(int(m.group(1)), []).append(path)
+    return dict(sorted(groups.items()))
+
+
+# ===========================================================================
+# Elevation helpers
+# ===========================================================================
 
 def interpolate_elevation(elev_x: np.ndarray, elev_z: np.ndarray,
                           query_x: float) -> Optional[float]:
+    """Linearly interpolate surface elevation at *query_x*."""
     if len(elev_x) == 0:
         return None
     return float(np.interp(query_x, elev_x, elev_z))
 
 
-# ---------------------------------------------------------------------------
-# Rock-depth point collector  (works with dict-based wing results)
-# ---------------------------------------------------------------------------
-def collect_rock_points(records: list,
-                        elev_dir: Path) -> dict[int, list[dict]]:
+# ===========================================================================
+# Geometry helpers
+# ===========================================================================
+
+def compute_offsets(geophone_locs: np.ndarray,
+                    times_ms: np.ndarray,
+                    shot_pos: Optional[float] = None
+                    ) -> tuple[np.ndarray, float, int]:
     """
-    Returns { transect_id : [ {x, z_surface, depth, z_rock, side, v2}, … ] }
-    Only includes wings where depth is valid and v2 >= V2_ROCK_MIN.
+    Compute absolute source–receiver offsets.
+
+    Returns (offsets, true_shot_loc, shot_idx).
+    """
+    shot_idx    = int(np.argmin(times_ms))
+    nearest_geo = geophone_locs[shot_idx]
+    true_shot   = (float(shot_pos)
+                   if shot_pos is not None and shot_pos != 0.0
+                   else nearest_geo)
+    return np.abs(geophone_locs - true_shot), true_shot, shot_idx
+
+
+# ===========================================================================
+# Breakpoint detection
+# ===========================================================================
+
+def _ssr_breakpoint(wing_offsets: np.ndarray,
+                    wing_times_sec: np.ndarray,
+                    min_points: int) -> int:
+    """Fallback: minimum-SSR two-segment split."""
+    n = len(wing_offsets)
+    best_ssr, best_idx = np.inf, n - 2
+
+    for idx in range(min_points, n - min_points + 1):
+        v2_off, v2_t = wing_offsets[idx:], wing_times_sec[idx:]
+        if len(v2_off) < 2:
+            continue
+        sl, *_ = linregress(v2_off, v2_t)
+        if sl <= 0:
+            continue
+        v1_fit = np.polyval(
+            np.polyfit(wing_offsets[:idx], wing_times_sec[:idx], 1),
+            wing_offsets[:idx])
+        v2_fit = np.polyval(np.polyfit(v2_off, v2_t, 1), v2_off)
+        ssr = (np.sum((wing_times_sec[:idx] - v1_fit) ** 2) +
+               np.sum((v2_t - v2_fit) ** 2))
+        if ssr < best_ssr:
+            best_ssr, best_idx = ssr, idx
+    return best_idx
+
+
+def find_breakpoint_on_wing(wing_offsets: np.ndarray,
+                             wing_times_sec: np.ndarray,
+                             min_points: int = MIN_SEGMENT_POINTS) -> int:
+    """
+    Locate the V1→V2 breakpoint on one wing.
+
+    1. Grow a far-end seed until its regression slope is positive.
+    2. Extend leftward while slope stays positive and ≤ seed × tolerance.
+    3. Fall back to SSR split if no positive slope exists.
+    """
+    n = len(wing_offsets)
+    if n < 2 * min_points:
+        return _ssr_breakpoint(wing_offsets, wing_times_sec, min_points)
+
+    seed_start: Optional[int]   = None
+    seed_slope: Optional[float] = None
+
+    for seed_size in range(min_points, n + 1):
+        start   = n - seed_size
+        seg_off = wing_offsets[start:]
+        seg_t   = wing_times_sec[start:]
+        if len(seg_off) < 2:
+            continue
+        sl, *_ = linregress(seg_off, seg_t)
+        if sl > 0:
+            seed_start, seed_slope = start, sl
+            break
+
+    if seed_slope is None:
+        print("    ⚠  No positive V2 slope on wing – SSR fallback.")
+        return _ssr_breakpoint(wing_offsets, wing_times_sec, min_points)
+
+    best_start = seed_start
+    for ext in range(seed_start - 1, min_points - 1, -1):
+        sl, *_ = linregress(wing_offsets[ext:], wing_times_sec[ext:])
+        if sl <= 0 or sl > seed_slope * BP_SLOPE_TOLERANCE:
+            break
+        best_start = ext
+    return best_start
+
+
+# ===========================================================================
+# Per-wing refraction fit
+# ===========================================================================
+
+def _fit_wing(wing_geo: np.ndarray,
+              wing_offsets: np.ndarray,
+              wing_times_sec: np.ndarray,
+              full_geo: np.ndarray,
+              full_offsets: np.ndarray,
+              full_times_sec: np.ndarray,
+              side: str,
+              min_points: int = MIN_SEGMENT_POINTS) -> WingResult:
+    """
+    Two-segment linear fit on one wing.
+    Returns a parameter dict, or None if the wing is too short.
+    """
+    if len(wing_offsets) < 2 * min_points:
+        return None
+
+    v2_local_start    = find_breakpoint_on_wing(
+        wing_offsets, wing_times_sec, min_points)
+    wing_full_indices = np.array(
+        [np.where(full_geo == g)[0][0] for g in wing_geo])
+
+    v2_mask = np.zeros(len(full_geo), dtype=bool)
+    v2_mask[wing_full_indices[v2_local_start:]] = True
+    v1_mask = ~v2_mask
+
+    slope2, intercept2, *_ = linregress(full_offsets[v2_mask],
+                                        full_times_sec[v2_mask])
+    slope1, intercept1, *_ = linregress(full_offsets[v1_mask],
+                                        full_times_sec[v1_mask])
+
+    for name, sl in (('V1', slope1), ('V2', slope2)):
+        if sl <= 0:
+            print(f"    ⚠  [{side}] {name} slope non-positive "
+                  f"({sl:.6f}) – unreliable.")
+
+    slope1 = abs(slope1) if slope1 <= 0 else slope1
+    slope2 = abs(slope2) if slope2 <= 0 else slope2
+
+    v1, v2 = 1.0 / slope1, 1.0 / slope2
+    t_i    = intercept2
+    depth  = (
+        (t_i * v1 * v2) / (2.0 * np.sqrt(v2 ** 2 - v1 ** 2))
+        if v2 >= V2_ROCK_MIN and (v2 ** 2 - v1 ** 2) > 0
+        else float('nan')
+    )
+
+    return dict(
+        side       = side,
+        v1         = v1,
+        v2         = v2,
+        t_i_ms     = t_i * 1000.0,
+        depth      = depth,
+        slope1     = slope1,
+        intercept1 = intercept1,
+        slope2     = slope2,
+        intercept2 = intercept2,
+        bp_offset  = float(full_offsets[v2_mask].min()),
+        bp_geo     = 0.0,
+        v2_mask    = v2_mask,
+    )
+
+
+# ===========================================================================
+# Plausibility checks
+# ===========================================================================
+
+def _check_wing(wing: WingResult, label: str, warnings: list[str]) -> None:
+    """Append warning strings for out-of-range velocities."""
+    if wing is None:
+        return
+    v1, v2 = wing['v1'], wing['v2']
+    checks = [
+        (not (V1_MIN <= v1 <= V1_MAX),
+         f"⚠ {label} V1 = {v1:.0f} m/s outside "
+         f"[{V1_MIN:.0f}–{V1_MAX:.0f}]"),
+        (not (V2_MIN <= v2 <= V2_MAX),
+         f"⚠ {label} V2 = {v2:.0f} m/s outside "
+         f"[{V2_MIN:.0f}–{V2_MAX:.0f}]"),
+        (v2 <= v1,
+         f"⚠ {label} V2 ≤ V1 – refraction condition not met"),
+    ]
+    for condition, msg in checks:
+        if condition:
+            print(f"    {msg}")
+            warnings.append(msg)
+
+
+# ===========================================================================
+# Shot analyser
+# ===========================================================================
+
+def analyse_shot(geophone_locs: np.ndarray,
+                 times_ms: np.ndarray,
+                 shot_pos: Optional[float] = None) -> ShotResult:
+    """
+    Full ITM analysis for one shot record.
+
+    Returns dict with keys: right, left, true_shot_loc, offsets, warnings.
+    """
+    times_sec = times_ms / 1000.0
+    offsets, true_shot_loc, shot_idx = compute_offsets(
+        geophone_locs, times_ms, shot_pos=shot_pos)
+
+    print(f"  Shot pos (header) : {shot_pos} m  |  "
+          f"nearest geo : {geophone_locs[shot_idx]:.1f} m  |  "
+          f"true shot : {true_shot_loc:.1f} m")
+
+    left_idx  = np.where(geophone_locs < true_shot_loc)[0]
+    right_idx = np.where(geophone_locs > true_shot_loc)[0]
+    left_idx_s  = left_idx[np.argsort(offsets[left_idx])]
+    right_idx_s = right_idx[np.argsort(offsets[right_idx])]
+
+    print(f"  Wings → left : {len(left_idx)} pts  |  "
+          f"right : {len(right_idx)} pts")
+
+    warnings: list[str] = []
+
+    def _process_wing(idx_sorted, side: str, sign: int) -> WingResult:
+        if len(idx_sorted) == 0:
+            print(f"  — {side.capitalize()} wing: no geophones – skipped.")
+            return None
+        print(f"  — {side.capitalize()} wing —")
+        result = _fit_wing(
+            wing_geo       = geophone_locs[idx_sorted],
+            wing_offsets   = offsets[idx_sorted],
+            wing_times_sec = times_sec[idx_sorted],
+            full_geo       = geophone_locs,
+            full_offsets   = offsets,
+            full_times_sec = times_sec,
+            side           = side,
+        )
+        if result is None:
+            print("    Too few points – skipped.")
+            return None
+        result['bp_geo'] = true_shot_loc + sign * result['bp_offset']
+        print(f"    V1={result['v1']:.1f}  V2={result['v2']:.1f} m/s  "
+              f"t_i={result['t_i_ms']:.2f} ms  "
+              f"z={result['depth']:.2f} m  "
+              f"BP@{result['bp_geo']:.1f} m")
+        _check_wing(result, side.capitalize(), warnings)
+        return result
+
+    return dict(
+        right         = _process_wing(right_idx_s, 'right', +1),
+        left          = _process_wing(left_idx_s,  'left',  -1),
+        true_shot_loc = true_shot_loc,
+        offsets       = offsets,
+        warnings      = warnings,
+    )
+
+
+# ===========================================================================
+# Rock-depth collector
+# ===========================================================================
+
+def collect_rock_points(records: list[dict],
+                        elev_data: dict[int, tuple[np.ndarray, np.ndarray]]
+                        ) -> dict[int, list[dict]]:
+    """
+    Convert ITM depths to absolute rock elevations per transect.
+
+    Only wings with depth > 0 and v2 >= V2_ROCK_MIN are included.
+    Uses the in-memory *elev_data* dict instead of on-disk files.
     """
     rock: dict[int, list[dict]] = {}
 
@@ -68,19 +578,14 @@ def collect_rock_points(records: list,
         tid = rec['transect_id']
         res = rec['res']
 
-        elev_path = find_elevation_file(elev_dir, tid)
-        if elev_path is None:
+        if tid not in elev_data:
             continue
-        elev_x, elev_z = read_elevation_file(elev_path)
+        elev_x, elev_z = elev_data[tid]
 
-        for wing in (res.get('right'), res.get('left')):
-            if wing is None:
-                continue
+        for wing in filter(None, (res.get('right'), res.get('left'))):
             depth = wing.get('depth', float('nan'))
             v2    = wing.get('v2',    float('nan'))
-            if np.isnan(depth) or depth <= 0:
-                continue
-            if v2 < V2_ROCK_MIN:
+            if np.isnan(depth) or depth <= 0 or v2 < V2_ROCK_MIN:
                 continue
 
             x      = res['true_shot_loc']
@@ -89,437 +594,37 @@ def collect_rock_points(records: list,
                 continue
 
             rock.setdefault(tid, []).append(dict(
-                x_geo    = x,
-                z_surface= z_surf,
-                depth    = depth,
-                z_rock   = z_surf - depth,
-                side     = wing['side'],
-                v2       = v2,
+                x_geo     = x,
+                z_surface = z_surf,
+                depth     = depth,
+                z_rock    = z_surf - depth,
+                side      = wing['side'],
+                v2        = v2,
             ))
 
     return rock
 
 
-# ---------------------------------------------------------------------------
-# Elevation / rock-depth plot
-# ---------------------------------------------------------------------------
-def _draw_elevation_plot(ax, elev_x: np.ndarray, elev_z: np.ndarray,
-                         rock_points: list[dict], title: str):
-    if len(elev_x) == 0:
-        ax.set_title(title + '  [no elevation data]')
-        return
+# ===========================================================================
+# Travel-time plot
+# ===========================================================================
 
-    # Ground surface
-    ax.fill_between(elev_x, elev_z, elev_z.min() - 2,
-                    color='#D2B48C', alpha=0.45, label='Ground surface')
-    ax.plot(elev_x, elev_z,
-            color='saddlebrown', linewidth=1.8, label='Elevation profile')
-
-    # Rock depth points
-    if rock_points:
-        pts_sorted = sorted(rock_points, key=lambda p: p['x_geo'])
-
-        x_rock = np.array([p['x_geo']  for p in pts_sorted])
-        z_rock = np.array([p['z_rock'] for p in pts_sorted])
-
-        # Connecting dashed line
-        ax.plot(x_rock, z_rock,
-                color='dimgray', linestyle='--', linewidth=0.9,
-                alpha=0.6, zorder=3)
-
-        # Markers per side
-        for side, color, label in [
-                ('right', 'steelblue', 'Rock (right wing)'),
-                ('left',  'darkgreen', 'Rock (left wing)'),
-        ]:
-            xs = [p['x_geo']  for p in pts_sorted if p['side'] == side]
-            zs = [p['z_rock'] for p in pts_sorted if p['side'] == side]
-            if xs:
-                ax.scatter(xs, zs, color=color, marker='D',
-                           s=55, zorder=5, label=label)
-
-        # Depth labels
-        for p in pts_sorted:
-            ax.annotate(f"{p['depth']:.1f} m",
-                        xy=(p['x_geo'], p['z_rock']),
-                        xytext=(4, -10), textcoords='offset points',
-                        fontsize=6.5, color='navy')
-
-    # Axis limits with margin
-    all_z = list(elev_z)
-    if rock_points:
-        all_z += [p['z_rock'] for p in rock_points]
-    z_min, z_max = min(all_z), max(all_z)
-    margin = (z_max - z_min) * 0.15 or 0.5
-    ax.set_ylim(z_min - margin, z_max + margin)
-    ax.set_xlim(elev_x.min() - 0.5, elev_x.max() + 0.5)
-
-    ax.set_xlabel('Distance along transect (m)', fontsize=8)
-    ax.set_ylabel('Elevation (m ASL)', fontsize=8)
-    ax.set_title(title, fontsize=9)
-    ax.legend(fontsize=7, loc='upper right')
-    ax.grid(True, alpha=0.35)
-    ax.tick_params(labelsize=7)
-
-
-def save_elevation_pdf(records: list, elev_dir: Path, pdf_path: Path):
-    rock_by_tid = collect_rock_points(records, elev_dir)
-
-    # One entry per transect, in encounter order
-    seen = {}
-    for rec in records:
-        tid = rec['transect_id']
-        if tid not in seen:
-            seen[tid] = rec
-    transect_ids = list(seen.keys())
-
-    if not transect_ids:
-        print("  No transect data to plot in elevation PDF.")
-        return
-
-    A4_W, A4_H = 8.27, 11.69
-    LEFT, RIGHT, BOTTOM, TOP, HGAP = 0.10, 0.97, 0.05, 0.96, 0.07
-    plot_w  = RIGHT - LEFT
-    plot_h  = (TOP - BOTTOM - HGAP) / 2.0
-    bottoms = [BOTTOM + plot_h + HGAP, BOTTOM]
-
-    with pdf_backend.PdfPages(pdf_path) as pdf:
-        i = 0
-        while i < len(transect_ids):
-            fig = plt.figure(figsize=(A4_W, A4_H))
-            fig.patch.set_facecolor('white')
-
-            for slot in range(2):
-                if i >= len(transect_ids):
-                    break
-                tid = transect_ids[i]
-                i  += 1
-
-                elev_path = find_elevation_file(elev_dir, tid)
-                if elev_path is None:
-                    elev_x = np.array([])
-                    elev_z = np.array([])
-                    print(f"  ⚠  No elevation file for transect {tid}")
-                else:
-                    elev_x, elev_z = read_elevation_file(elev_path)
-
-                ax = fig.add_axes([LEFT, bottoms[slot], plot_w, plot_h])
-                _draw_elevation_plot(
-                    ax, elev_x, elev_z,
-                    rock_by_tid.get(tid, []),
-                    title=f"Transect {tid} — Ground profile & rock depth")
-
-            pdf.savefig(fig, bbox_inches='tight')
-            plt.close(fig)
-
-    print(f"  Elevation PDF saved → {pdf_path}")
-
-
-# ---------------------------------------------------------------------------
-# File I/O  (unchanged from working version)
-# ---------------------------------------------------------------------------
-def read_vs_file(file_path):
-    shot_pos  = None
-    distances = np.array([])
-    times_ms  = np.array([])
-    with open(file_path, 'r') as file:
-        for line_num, line in enumerate(file, start=1):
-            row = line.strip().split()
-            if line_num < 3:
-                continue
-            if line_num == 3:
-                shot_pos = float(row[0])
-                continue
-            if line_num > 3 and line_num < 28:
-                if len(row) >= 2:
-                    try:
-                        distances = np.append(distances, float(row[0]))
-                        times_ms  = np.append(times_ms,  float(row[1]))
-                    except ValueError:
-                        print(f"  Warning: Non-numeric data on line {line_num}"
-                              f" – '{line.strip()}'")
-            else:
-                break
-    return shot_pos, distances, times_ms
-
-
-def group_by_transect(vs_files):
-    groups: dict[int, list[Path]] = {}
-    pattern = re.compile(r'^(\d+)-(\d+)\.vs$', re.IGNORECASE)
-    for p in vs_files:
-        m = pattern.match(p.name)
-        if not m:
-            print(f"  Skipping unrecognised filename: {p.name}")
-            continue
-        tid = int(m.group(1))
-        groups.setdefault(tid, []).append(p)
-    return dict(sorted(groups.items()))
-
-
-# ---------------------------------------------------------------------------
-# Offset / geometry helpers  (unchanged from working version)
-# ---------------------------------------------------------------------------
-def compute_offsets(geophone_locs, times_ms, shot_pos=None):
-    shot_idx    = int(np.argmin(times_ms))
-    nearest_geo = geophone_locs[shot_idx]
-    if shot_pos is not None and shot_pos != 0.0:
-        true_shot_loc = float(shot_pos)
-    else:
-        true_shot_loc = nearest_geo
-    offsets = np.abs(geophone_locs - true_shot_loc)
-    return offsets, true_shot_loc, shot_idx
-
-
-# ---------------------------------------------------------------------------
-# Breakpoint detection  (unchanged from working version)
-# ---------------------------------------------------------------------------
-def find_breakpoint_on_wing(wing_offsets, wing_times_sec, min_points=3):
-    n = len(wing_offsets)
-    if n < 2 * min_points:
-        return _ssr_breakpoint_wing(wing_offsets, wing_times_sec, min_points)
-
-    # ── Step 1: Find a valid positive-slope seed at the far end ───────────────
-    # Start from the last `min_points` points and shrink inward until we get
-    # a positive slope.  If even 2 points at the very end give negative slope,
-    # we must grow leftward (Step 2b) until the slope becomes positive.
-    seed_start = None
-    seed_slope = None
-
-    for seed_size in range(min_points, n + 1):          # grow seed if needed
-        start   = n - seed_size
-        seg_off = wing_offsets[start:]
-        seg_t   = wing_times_sec[start:]
-        if len(seg_off) < 2:
-            continue
-        sl, *_ = linregress(seg_off, seg_t)
-        if sl > 0:
-            seed_start = start
-            seed_slope = sl
-            break
-
-    if seed_slope is None:
-        # Every possible right-end segment has a non-positive slope –
-        # the wing has no detectable refractor; fall back to SSR split.
-        print("    ⚠  No positive V2 slope found anywhere on wing; "
-              "falling back to SSR breakpoint.")
-        return _ssr_breakpoint_wing(wing_offsets, wing_times_sec, min_points)
-
-    # ── Step 2: Extend the V2 segment leftward as long as slope stays ─────────
-    # positive and does not deviate more than `tolerance` from the seed slope.
-    tolerance     = 1.20          # allow up to 20 % steeper than seed slope
-    best_v2_start = seed_start
-
-    for extend_start in range(seed_start - 1, min_points - 1, -1):
-        seg_off = wing_offsets[extend_start:]
-        seg_t   = wing_times_sec[extend_start:]
-        if len(seg_off) < 2:
-            break
-        sl, *_ = linregress(seg_off, seg_t)
-        if sl <= 0:
-            break                           # slope went negative – stop
-        if sl > seed_slope * tolerance:
-            break                           # slope got too steep – stop
-        best_v2_start = extend_start       # this start is still acceptable
-
-    return best_v2_start
-
-
-def _ssr_breakpoint_wing(wing_offsets, wing_times_sec, min_points):
-    n        = len(wing_offsets)
-    best_ssr = np.inf
-    best_idx = n - 2
-
-    for idx in range(min_points, n - min_points + 1):
-        if len(wing_offsets[idx:]) >= 2:
-            sl, *_ = linregress(wing_offsets[idx:], wing_times_sec[idx:])
-            if sl <= 0:
-                continue
-        p1  = np.polyval(np.polyfit(wing_offsets[:idx],
-                                    wing_times_sec[:idx], 1),
-                         wing_offsets[:idx])
-        p2  = np.polyval(np.polyfit(wing_offsets[idx:],
-                                    wing_times_sec[idx:], 1),
-                         wing_offsets[idx:])
-        ssr = (np.sum((wing_times_sec[:idx] - p1) ** 2) +
-               np.sum((wing_times_sec[idx:] - p2) ** 2))
-        if ssr < best_ssr:
-            best_ssr = ssr
-            best_idx = idx
-    return best_idx
-
-
-# ---------------------------------------------------------------------------
-# Per-wing fitting  (unchanged from working version, returns dict)
-# ---------------------------------------------------------------------------
-def _fit_wing(wing_geo, wing_offsets, wing_times_sec,
-              full_geo, full_offsets, full_times_sec,
-              side, min_points=3):
-    n_wing = len(wing_offsets)
-    if n_wing < 2 * min_points:
-        return None
-
-    v2_local_start = find_breakpoint_on_wing(
-        wing_offsets, wing_times_sec, min_points)
-
-    wing_full_indices = np.array(
-        [np.where(full_geo == g)[0][0] for g in wing_geo])
-
-    v2_mask_full = np.zeros(len(full_geo), dtype=bool)
-    v2_mask_full[wing_full_indices[v2_local_start:]] = True
-    v1_mask_full = ~v2_mask_full
-
-    slope2, intercept2, *_ = linregress(
-        full_offsets[v2_mask_full], full_times_sec[v2_mask_full])
-    slope1, intercept1, *_ = linregress(
-        full_offsets[v1_mask_full], full_times_sec[v1_mask_full])
-
-    if slope1 <= 0:
-        print(f"    ⚠  [{side}] V1 slope non-positive ({slope1:.6f}) "
-              f"– result unreliable.")
-    if slope2 <= 0:
-        print(f"    ⚠  [{side}] V2 slope non-positive ({slope2:.6f}) "
-              f"– result unreliable.")
-
-    slope1 = abs(slope1) if slope1 <= 0 else slope1
-    slope2 = abs(slope2) if slope2 <= 0 else slope2
-
-    v1     = 1.0 / slope1
-    v2     = 1.0 / slope2
-    t_i    = intercept2
-    t_i_ms = t_i * 1000.0
-
-    if v2 >= V2_ROCK_MIN and v2 ** 2 - v1 ** 2 > 0:
-        depth = (t_i * v1 * v2) / (2.0 * np.sqrt(v2 ** 2 - v1 ** 2))
-    else:
-        depth = float('nan')
-
-    bp_offset = full_offsets[v2_mask_full].min()
-
-    return dict(
-        v1=v1, v2=v2, t_i_ms=t_i_ms, depth=depth,
-        slope1=slope1, intercept1=intercept1,
-        slope2=slope2, intercept2=intercept2,
-        bp_offset=bp_offset,
-        v2_mask=v2_mask_full,
-        side=side,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Plausibility checks  (unchanged from working version)
-# ---------------------------------------------------------------------------
-def _check_wing(wing_res, label, warnings):
-    if wing_res is None:
-        return
-    v1, v2 = wing_res['v1'], wing_res['v2']
-    if not (V1_MIN <= v1 <= V1_MAX):
-        msg = f"⚠ {label} V1 = {v1:.0f} m/s outside [{V1_MIN}–{V1_MAX}] m/s"
-        print(f"    {msg}")
-        warnings.append(msg)
-    if not (V2_MIN <= v2 <= V2_MAX):
-        msg = f"⚠ {label} V2 = {v2:.0f} m/s outside [{V2_MIN}–{V2_MAX}] m/s"
-        print(f"    {msg}")
-        warnings.append(msg)
-    if v2 <= v1:
-        msg = f"⚠ {label} V2 ≤ V1 – refraction condition not met"
-        print(f"    {msg}")
-        warnings.append(msg)
-
-
-# ---------------------------------------------------------------------------
-# Shot analyser  (unchanged from working version)
-# ---------------------------------------------------------------------------
-def analyse_shot(geophone_locs, times_ms, shot_pos=None):
-    times_sec = times_ms / 1000.0
-    offsets, true_shot_loc, shot_idx = compute_offsets(
-        geophone_locs, times_ms, shot_pos=shot_pos)
-
-    nearest_geo = geophone_locs[shot_idx]
-    print(f"  Shot pos (header)   : {shot_pos} m  |  "
-          f"nearest geophone : {nearest_geo:.1f} m  |  "
-          f"true shot loc : {true_shot_loc:.1f} m")
-    if shot_pos and shot_pos != 0.0:
-        print(f"  Sub-geophone correction : "
-              f"{abs(true_shot_loc - nearest_geo):.2f} m")
-
-    left_idx  = np.where(geophone_locs < true_shot_loc)[0]
-    right_idx = np.where(geophone_locs > true_shot_loc)[0]
-
-    left_sort  = np.argsort(offsets[left_idx])
-    right_sort = np.argsort(offsets[right_idx])
-
-    left_idx_sorted  = left_idx[left_sort]
-    right_idx_sorted = right_idx[right_sort]
-
-    print(f"  Wing sizes  →  left : {len(left_idx)} pts  |  "
-          f"right : {len(right_idx)} pts")
-
-    warnings = []
-
-    print("  — Right wing (forward) —")
-    right_res = _fit_wing(
-        wing_geo       = geophone_locs[right_idx_sorted],
-        wing_offsets   = offsets[right_idx_sorted],
-        wing_times_sec = times_sec[right_idx_sorted],
-        full_geo       = geophone_locs,
-        full_offsets   = offsets,
-        full_times_sec = times_sec,
-        side           = 'right',
-    )
-    if right_res is not None:
-        right_res['bp_geo'] = true_shot_loc + right_res['bp_offset']
-        print(f"    V1={right_res['v1']:.1f}  V2={right_res['v2']:.1f} m/s  "
-              f"t_i={right_res['t_i_ms']:.2f} ms  "
-              f"z={right_res['depth']:.2f} m  "
-              f"BP@{right_res['bp_geo']:.1f} m")
-        _check_wing(right_res, 'Right', warnings)
-    else:
-        print("    Right wing too short – skipped.")
-
-    print("  — Left wing (reverse) —")
-    left_res = _fit_wing(
-        wing_geo       = geophone_locs[left_idx_sorted],
-        wing_offsets   = offsets[left_idx_sorted],
-        wing_times_sec = times_sec[left_idx_sorted],
-        full_geo       = geophone_locs,
-        full_offsets   = offsets,
-        full_times_sec = times_sec,
-        side           = 'left',
-    )
-    if left_res is not None:
-        left_res['bp_geo'] = true_shot_loc - left_res['bp_offset']
-        print(f"    V1={left_res['v1']:.1f}  V2={left_res['v2']:.1f} m/s  "
-              f"t_i={left_res['t_i_ms']:.2f} ms  "
-              f"z={left_res['depth']:.2f} m  "
-              f"BP@{left_res['bp_geo']:.1f} m")
-        _check_wing(left_res, 'Left', warnings)
-    else:
-        print("    Left wing too short – skipped.")
-
-    return dict(
-        right         = right_res,
-        left          = left_res,
-        true_shot_loc = true_shot_loc,
-        offsets       = offsets,
-        warnings      = warnings,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Traveltime plot  (unchanged from working version)
-# ---------------------------------------------------------------------------
-def _draw_plot(ax, geophone_locs, times_ms, res, title):
+def _draw_traveltime_plot(ax: plt.Axes,
+                          geophone_locs: np.ndarray,
+                          times_ms: np.ndarray,
+                          res: ShotResult,
+                          title: str) -> None:
+    """Travel-time vs. geophone-position plot for one shot."""
     true_shot_loc = res['true_shot_loc']
     warnings      = res.get('warnings', [])
     right         = res.get('right')
     left          = res.get('left')
-
     ref = right if right is not None else left
     if ref is None:
         ax.set_title(title + '  [no data]')
         return
 
-    for wing, color in [(right, 'blue'), (left, 'darkgreen')]:
+    for wing, color in ((right, 'blue'), (left, 'darkgreen')):
         if wing is None:
             continue
         mask = wing['v2_mask']
@@ -527,44 +632,41 @@ def _draw_plot(ax, geophone_locs, times_ms, res, title):
                    color=color, zorder=5, s=70, marker='D',
                    label=f"V2 {wing['side']} ({mask.sum()} pts)")
 
-    ax.scatter(geophone_locs, times_ms, color='red', zorder=6, s=20,
-               label='First-arrival picks')
+    ax.scatter(geophone_locs, times_ms,
+               color='red', zorder=6, s=20, label='First-arrival picks')
 
-    geo_full     = np.linspace(geophone_locs.min(), geophone_locs.max(), 500)
-    abs_off_full = np.abs(geo_full - true_shot_loc)
+    geo_full = np.linspace(geophone_locs.min(), geophone_locs.max(), 500)
+    off_full = np.abs(geo_full - true_shot_loc)
     ax.plot(geo_full,
-            (ref['slope1'] * abs_off_full + ref['intercept1']) * 1000,
+            (ref['slope1'] * off_full + ref['intercept1']) * 1000,
             color='green', linestyle='--', linewidth=1.5,
-            label=f"V1 = {ref['v1']:.0f} m/s  (sand)")
+            label=f"V1 = {ref['v1']:.0f} m/s")
 
-    if right is not None:
-        geo_r = np.linspace(true_shot_loc, geophone_locs.max(), 300)
-        off_r = geo_r - true_shot_loc
-        ax.plot(geo_r,
-                (right['slope2'] * off_r + right['intercept2']) * 1000,
-                color='blue', linestyle='--', linewidth=1.5,
-                label=f"V2 right = {right['v2']:.0f} m/s")
-
-    if left is not None:
-        geo_l = np.linspace(geophone_locs.min(), true_shot_loc, 300)
-        off_l = true_shot_loc - geo_l
-        ax.plot(geo_l,
-                (left['slope2'] * off_l + left['intercept2']) * 1000,
-                color='darkgreen', linestyle='--', linewidth=1.5,
-                label=f"V2 left  = {left['v2']:.0f} m/s")
+    for wing, color, geo_lo, geo_hi, sign in (
+            (right, 'blue',      true_shot_loc,       geophone_locs.max(), +1),
+            (left,  'darkgreen', geophone_locs.min(), true_shot_loc,       -1),
+    ):
+        if wing is None:
+            continue
+        geo_w = np.linspace(geo_lo, geo_hi, 300)
+        ax.plot(geo_w,
+                (wing['slope2'] * sign * (geo_w - true_shot_loc)
+                 + wing['intercept2']) * 1000,
+                color=color, linestyle='--', linewidth=1.5,
+                label=f"V2 {wing['side']} = {wing['v2']:.0f} m/s")
 
     ax.axvline(x=true_shot_loc, color='purple', linestyle='-',
                linewidth=1.2, zorder=4,
                label=f'Shot @ {true_shot_loc:.1f} m')
 
-    for wing, color in [(right, 'orange'), (left, 'saddlebrown')]:
+    for wing, color in ((right, 'orange'), (left, 'saddlebrown')):
         if wing is None:
             continue
         ax.axvline(x=wing['bp_geo'], color=color, linestyle='--',
                    linewidth=1.2, zorder=4,
                    label=f"BP {wing['side']} @ {wing['bp_geo']:.1f} m")
 
-    for wing, color in [(right, 'steelblue'), (left, 'teal')]:
+    for wing, color in ((right, 'steelblue'), (left, 'teal')):
         if wing is None:
             continue
         ax.axhline(y=wing['t_i_ms'], color=color, linestyle=':',
@@ -573,23 +675,22 @@ def _draw_plot(ax, geophone_locs, times_ms, res, title):
         ax.scatter([true_shot_loc], [wing['t_i_ms']],
                    color=color, zorder=7, s=60, marker='^')
 
-    lines = []
-    if right is not None:
-        lines += [f"Right:  V1={right['v1']:.0f}  V2={right['v2']:.0f} m/s"
-                  f"  t_i={right['t_i_ms']:.1f} ms  z={right['depth']:.2f} m"]
-    if left is not None:
-        lines += [f"Left:   V1={left['v1']:.0f}  V2={left['v2']:.0f} m/s"
-                  f"  t_i={left['t_i_ms']:.1f} ms  z={left['depth']:.2f} m"]
+    lines: list[str] = []
+    for wing in filter(None, (right, left)):
+        lines.append(
+            f"{wing['side'].capitalize()}: "
+            f"V1={wing['v1']:.0f}  V2={wing['v2']:.0f} m/s  "
+            f"t_i={wing['t_i_ms']:.1f} ms  z={wing['depth']:.2f} m")
     if right is not None and left is not None:
         z_avg = np.nanmean([right['depth'], left['depth']])
-        lines += [f"z avg = {z_avg:.2f} m  |  Shot @ {true_shot_loc:.1f} m"]
+        lines.append(f"z avg = {z_avg:.2f} m  |  "
+                     f"Shot @ {true_shot_loc:.1f} m")
 
     ax.annotate('\n'.join(lines),
                 xy=(0.02, 0.97), xycoords='axes fraction', fontsize=7.5,
                 verticalalignment='top', family='monospace',
                 bbox=dict(boxstyle='round,pad=0.4',
                           facecolor='wheat', alpha=0.9))
-
     if warnings:
         ax.annotate('\n'.join(warnings),
                     xy=(0.02, 0.02), xycoords='axes fraction', fontsize=7,
@@ -598,31 +699,258 @@ def _draw_plot(ax, geophone_locs, times_ms, res, title):
                               edgecolor='red', linewidth=1.2, alpha=0.95))
 
     ax.set_xlabel('Geophone position (m)')
-    ax.set_ylabel('Travel Time (ms)')
+    ax.set_ylabel('Travel time (ms)')
     ax.set_title(title, color='darkred' if warnings else 'black')
     ax.legend(fontsize=7, loc='lower right')
     ax.grid(True, alpha=0.4)
 
 
-# ---------------------------------------------------------------------------
-# Traveltime PDF  (unchanged from working version)
-# ---------------------------------------------------------------------------
-def save_pdf(records, pdf_path):
-    A4_W, A4_H = 8.27, 11.69
-    LEFT, RIGHT, BOTTOM, TOP, HGAP = 0.10, 0.97, 0.04, 0.97, 0.06
-    plot_w  = RIGHT - LEFT
-    plot_h  = (TOP - BOTTOM - HGAP) / 2.0
-    bottoms = [BOTTOM + plot_h + HGAP, BOTTOM]
+# ===========================================================================
+# Elevation + geotech plot
+# ===========================================================================
+
+def _draw_geotech_overlays(ax: plt.Axes,
+                            elev_x: np.ndarray,
+                            elev_z: np.ndarray,
+                            geotech_pts: list[GeotechPoint],
+                            sheetpile: Optional[SheetPileLine]) -> None:
+    """
+    Overlay sheet-pile line and geotech test lines on an elevation axes.
+
+    Rules
+    -----
+    - Sheet-pile: dashed vertical line from surface to SHEET_PILE_DEPTH.
+    - Each test: solid vertical line from surface to tested_depth.
+    - Rock found: star marker at the rock depth with depth annotation.
+    - No rock found: NO point symbol at the bottom of the line.
+    """
+    # ── Sheet-pile ─────────────────────────────────────────────────────────────
+    if sheetpile is not None:
+        x_sp  = sheetpile.dist_x
+        z_top = interpolate_elevation(elev_x, elev_z, x_sp)
+        if z_top is not None:
+            z_bot = z_top - SHEET_PILE_DEPTH
+            ax.plot([x_sp, x_sp], [z_top, z_bot],
+                    color=_SHEET_PILE_COLOR, linestyle='--',
+                    linewidth=1.8, zorder=6,
+                    label=f"Sheet pile @ x={x_sp:.1f} m "
+                          f"(d={SHEET_PILE_DEPTH:.0f} m)")
+
+    # ── Geotech tests ─────────────────────────────────────────────────────────
+    legend_added: set[str] = set()
+
+    for pt in geotech_pts:
+        color  = (_DPL_COLOR if pt.test_type.upper() == 'DPL'
+                  else _CPTU_COLOR)
+        z_surf = interpolate_elevation(elev_x, elev_z, pt.dist_x)
+        if z_surf is None:
+            continue
+
+        z_bot = z_surf - pt.tested_depth
+
+        # Vertical test line
+        line_label = (pt.test_type
+                      if pt.test_type not in legend_added
+                      else '_nolegend_')
+        ax.plot([pt.dist_x, pt.dist_x], [z_surf, z_bot],
+                color=color, linewidth=1.4, zorder=5, label=line_label)
+        legend_added.add(pt.test_type)
+
+        # Rock marker + label (only when rock was encountered)
+        if pt.depth_of_rock is not None:
+            z_rock      = z_surf - pt.depth_of_rock
+            rock_label  = ('Rock (geotech)'
+                           if 'Rock (geotech)' not in legend_added
+                           else '_nolegend_')
+            ax.scatter([pt.dist_x], [z_rock],
+                       color=color, marker='*',
+                       s=_ROCK_MARKER_SIZE ** 2,
+                       zorder=7, label=rock_label)
+            legend_added.add('Rock (geotech)')
+            ax.annotate(f"{pt.depth_of_rock:.1f} m",
+                        xy=(pt.dist_x, z_rock),
+                        xytext=(4, 3), textcoords='offset points',
+                        fontsize=6, color=color, clip_on=True)
+
+
+def _draw_elevation_plot(ax: plt.Axes,
+                         elev_x: np.ndarray,
+                         elev_z: np.ndarray,
+                         rock_points: list[dict],
+                         title: str,
+                         geotech_pts: Optional[list[GeotechPoint]] = None,
+                         sheetpile: Optional[SheetPileLine] = None,
+                         ) -> None:
+    """
+    Ground-surface profile with ITM rock-depth points and geotech overlays.
+
+    The elevation data may not span the full plot x-range [ELEV_X_MIN,
+    ELEV_X_MAX].  Where it falls short the surface line is extended
+    horizontally (clamped) to the nearest known elevation so the fill and
+    profile always reach both axis edges.
+
+    Fixed axes  x: ELEV_X_MIN → ELEV_X_MAX
+                y: ELEV_Y_MIN → ELEV_Y_MAX
+    with 1:1 data-unit aspect ratio enforced by set_aspect('equal').
+    """
+    if len(elev_x) == 0:
+        ax.set_title(title + '  [no elevation data]')
+        return
+
+    # Build a dense x-grid that covers the full plot range, then
+    # use np.interp (which clamps at the boundary values) to get z.
+    # This automatically extends the profile line to both edges.
+    x_plot = np.linspace(ELEV_X_MIN, ELEV_X_MAX, 1000)
+    z_plot = np.interp(x_plot, elev_x, elev_z)   # clamps outside data range
+
+    # ── Ground surface ────────────────────────────────────────────────────────
+    ax.fill_between(x_plot, z_plot, ELEV_Y_MIN,
+                    color='#D2B48C', alpha=0.45, label='Ground surface')
+    ax.plot(x_plot, z_plot,
+            color='saddlebrown', linewidth=1.8, label='Elevation profile')
+
+    # Mark the extent of actual measured data vs. extrapolated ends
+    x_data_min, x_data_max = elev_x.min(), elev_x.max()
+    for x_lo, x_hi in (
+            (ELEV_X_MIN, min(x_data_min, ELEV_X_MAX)),
+            (max(x_data_max, ELEV_X_MIN), ELEV_X_MAX),
+    ):
+        if x_lo < x_hi:
+            mask = (x_plot >= x_lo) & (x_plot <= x_hi)
+            ax.plot(x_plot[mask], z_plot[mask],
+                    color='saddlebrown', linewidth=1.2,
+                    linestyle=':', alpha=0.6)   # dotted = extrapolated
+
+    # ── ITM rock-depth points ─────────────────────────────────────────────────
+    if rock_points:
+        pts    = sorted(rock_points, key=lambda p: p['x_geo'])
+        x_rock = np.array([p['x_geo']  for p in pts])
+        z_rock = np.array([p['z_rock'] for p in pts])
+
+        ax.plot(x_rock, z_rock,
+                color='dimgray', linestyle='--', linewidth=0.9,
+                alpha=0.6, zorder=3)
+
+        for side, color, label in (
+                ('right', 'steelblue', 'ITM rock (right wing)'),
+                ('left',  'darkgreen', 'ITM rock (left wing)'),
+        ):
+            xs = [p['x_geo']  for p in pts if p['side'] == side]
+            zs = [p['z_rock'] for p in pts if p['side'] == side]
+            if xs:
+                ax.scatter(xs, zs, color=color, marker='D',
+                           s=55, zorder=5, label=label)
+
+        for p in pts:
+            ax.annotate(f"{p['depth']:.1f} m",
+                        xy=(p['x_geo'], p['z_rock']),
+                        xytext=(4, -10), textcoords='offset points',
+                        fontsize=6.5, color='navy', clip_on=True)
+
+    # ── Geotech overlays ──────────────────────────────────────────────────────
+    # Pass the full (possibly extrapolated) x/z arrays so that
+    # interpolate_elevation works correctly for any x in [0, 28].
+    _draw_geotech_overlays(ax, x_plot, z_plot, geotech_pts or [], sheetpile)
+
+    # ── Fixed 1:1 axes ────────────────────────────────────────────────────────
+    ax.set_xlim(ELEV_X_MIN, ELEV_X_MAX)
+    ax.set_ylim(ELEV_Y_MIN, ELEV_Y_MAX)
+    ax.set_aspect('equal', adjustable='box')
+
+    ax.set_xlabel('Distance along transect (m)', fontsize=8)
+    ax.set_ylabel('Elevation (m ASL)', fontsize=8)
+    ax.set_title(title, fontsize=9)
+    ax.legend(fontsize=6, loc='lower right')
+    ax.grid(True, alpha=0.35)
+    ax.tick_params(labelsize=7)
+
+
+# ===========================================================================
+# PDF page layout
+# ===========================================================================
+
+# A4 portrait in inches
+_A4_W, _A4_H = 8.27, 11.69
+
+# Travel-time page margins (figure-fraction)
+_TT_L, _TT_R  = 0.10, 0.97
+_TT_B, _TT_T  = 0.04, 0.97
+_TT_GAP       = 0.06
+
+# Elevation page: we must honour a 1:1 data aspect for a 28×22 m data window.
+# Data aspect ratio = 28 / 22 ≈ 1.273  (wider than tall in data units).
+# On A4 (8.27 in wide), usable width ≈ 7.5 in  → plot height ≈ 7.5/1.273 ≈ 5.89 in.
+# With two plots + gap on 11.69 in page:  2×5.89 + gap < 11.69  ✓ (gap ≈ 0.4 in)
+_ELEV_MARGIN_IN = 0.55   # inches on each side / top / bottom
+_ELEV_GAP_IN    = 0.50   # inches between the two plots
+
+
+def _elev_page_layout() -> tuple[plt.Figure,
+                                  list[plt.Axes]]:
+    """
+    Create one A4 figure with two elevation axes that each have a true
+    1:1 data-unit aspect ratio for the 28 m × 22 m data window.
+
+    Returns (fig, [ax_top, ax_bottom]).
+    """
+    data_w = ELEV_X_MAX - ELEV_X_MIN          # 28 m
+    data_h = ELEV_Y_MAX - ELEV_Y_MIN          # 22 m
+    aspect = data_w / data_h                   # ≈ 1.273
+
+    usable_w_in = _A4_W - 2 * _ELEV_MARGIN_IN
+    plot_w_in   = usable_w_in
+    plot_h_in   = plot_w_in / aspect           # true 1:1 size
+
+    # Total height needed for two plots
+    total_h_in  = (2 * plot_h_in
+                   + _ELEV_GAP_IN
+                   + 2 * _ELEV_MARGIN_IN)
+
+    # If it doesn't fit on A4, scale down proportionally
+    if total_h_in > _A4_H:
+        scale       = _A4_H / total_h_in
+        plot_w_in  *= scale
+        plot_h_in  *= scale
+
+    fig_h = max(_A4_H,
+                2 * plot_h_in + _ELEV_GAP_IN + 2 * _ELEV_MARGIN_IN)
+    fig   = plt.figure(figsize=(_A4_W, fig_h))
+    fig.patch.set_facecolor('white')
+
+    # Convert to figure fractions
+    def _frac(inches: float) -> float:
+        return inches / fig_h
+
+    bot_lower = _frac(_ELEV_MARGIN_IN)
+    bot_upper = _frac(_ELEV_MARGIN_IN + plot_h_in + _ELEV_GAP_IN)
+    left_f    = _ELEV_MARGIN_IN / _A4_W
+    w_f       = plot_w_in / _A4_W
+    h_f       = _frac(plot_h_in)
+
+    ax_bot = fig.add_axes([left_f, bot_lower, w_f, h_f])
+    ax_top = fig.add_axes([left_f, bot_upper, w_f, h_f])
+
+    return fig, [ax_top, ax_bot]
+
+
+# ===========================================================================
+# PDF writers
+# ===========================================================================
+
+def save_traveltime_pdf(records: list[dict], pdf_path: Path) -> None:
+    """Write one travel-time plot per shot, two per A4 page."""
+    plot_w = _TT_R - _TT_L
+    plot_h = (_TT_T - _TT_B - _TT_GAP) / 2.0
+    bottoms = [_TT_B + plot_h + _TT_GAP, _TT_B]
 
     with pdf_backend.PdfPages(pdf_path) as pdf:
         prev_tid = None
         i = 0
         while i < len(records):
-            rec = records[i]
-            tid = rec['transect_id']
+            tid = records[i]['transect_id']
 
             if tid != prev_tid:
-                sep = plt.figure(figsize=(A4_W, 0.8))
+                sep = plt.figure(figsize=(_A4_W, 0.8))
                 sep.text(0.5, 0.5, f"Transect  {tid}",
                          ha='center', va='center',
                          fontsize=14, fontweight='bold',
@@ -631,94 +959,151 @@ def save_pdf(records, pdf_path):
                 plt.close(sep)
                 prev_tid = tid
 
-            fig = plt.figure(figsize=(A4_W, A4_H))
+            fig = plt.figure(figsize=(_A4_W, _A4_H))
             fig.patch.set_facecolor('white')
 
             for slot in range(2):
                 if i >= len(records) or records[i]['transect_id'] != tid:
                     break
                 r  = records[i]
-                ax = fig.add_axes([LEFT, bottoms[slot], plot_w, plot_h])
-                _draw_plot(ax,
-                           r['geophone_locs'], r['times_ms'], r['res'],
-                           title=f"Refraction ITM – {r['file_name']}")
+                ax = fig.add_axes([_TT_L, bottoms[slot], plot_w, plot_h])
+                _draw_traveltime_plot(
+                    ax, r['geophone_locs'], r['times_ms'], r['res'],
+                    title=f"Refraction ITM – {r['file_name']}")
                 i += 1
 
             pdf.savefig(fig, bbox_inches='tight')
             plt.close(fig)
 
-    print(f"  Traveltime PDF saved → {pdf_path}")
+    print(f"  Travel-time PDF saved → {pdf_path}")
 
 
-# ---------------------------------------------------------------------------
-# Excel output  (unchanged from working version)
-# ---------------------------------------------------------------------------
-def save_excel(results, xlsx_path):
+def save_elevation_pdf(records: list[dict],
+                       elev_data: dict[int, tuple[np.ndarray, np.ndarray]],
+                       pdf_path: Path,
+                       geotech_by_tid: Optional[
+                           dict[int, list[GeotechPoint]]] = None,
+                       sheetpile_by_tid: Optional[
+                           dict[int, SheetPileLine]] = None,
+                       ) -> None:
+    """
+    Write one elevation + rock-depth profile per transect, two per A4 page.
+    Each plot has a true 1:1 data-unit aspect ratio.
+    """
+    rock_by_tid   = collect_rock_points(records, elev_data)
+    transect_ids  = list(dict.fromkeys(r['transect_id'] for r in records))
+
+    # Also include transects that have geotech data but no seismic records
+    if geotech_by_tid:
+        for tid in geotech_by_tid:
+            if tid not in transect_ids:
+                transect_ids.append(tid)
+
+    if not transect_ids:
+        print("  No transect data – skipping elevation PDF.")
+        return
+
+    with pdf_backend.PdfPages(pdf_path) as pdf:
+        i = 0
+        while i < len(transect_ids):
+            fig, axes = _elev_page_layout()
+
+            for ax in axes:
+                if i >= len(transect_ids):
+                    ax.set_visible(False)
+                    continue
+
+                tid = transect_ids[i]
+                i  += 1
+
+                elev_x, elev_z = elev_data.get(tid,
+                                               (np.array([]), np.array([])))
+                if len(elev_x) == 0:
+                    print(f"  ⚠  No elevation data for transect {tid}")
+
+                _draw_elevation_plot(
+                    ax, elev_x, elev_z,
+                    rock_by_tid.get(tid, []),
+                    title=f"Transect {tid} — Ground profile & rock depth",
+                    geotech_pts = (geotech_by_tid or {}).get(tid),
+                    sheetpile   = (sheetpile_by_tid or {}).get(tid),
+                )
+
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close(fig)
+
+    print(f"  Elevation PDF saved → {pdf_path}")
+
+
+# ===========================================================================
+# Excel writer
+# ===========================================================================
+
+_HEADERS = [
+    "Transect", "File", "Shot pos (m)",
+    "V1 right (m/s)", "V2 right (m/s)", "t_i right (ms)", "Depth right (m)",
+    "V1 left (m/s)",  "V2 left (m/s)",  "t_i left (ms)",  "Depth left (m)",
+    "Depth avg (m)", "Warnings",
+]
+_COL_WIDTHS = [10, 24, 13, 14, 14, 14, 14, 13, 13, 13, 13, 13, 50]
+
+
+def _wing_val(wing: WingResult, key: str, decimals: int = 2):
+    """Safe getter – returns 'N/A' for missing / NaN values."""
+    if wing is None:
+        return 'N/A'
+    val = wing.get(key, float('nan'))
+    if isinstance(val, float):
+        return round(val, decimals) if not np.isnan(val) else 'N/A'
+    return val
+
+
+def save_excel(results: list[dict], xlsx_path: Path) -> None:
+    """Write a formatted summary spreadsheet."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Refraction ITM Results"
 
-    hdr_font  = Font(bold=True, color="FFFFFF")
-    hdr_fill  = PatternFill("solid", fgColor="2F5496")
-    hdr_align = Alignment(horizontal="center", vertical="center",
-                          wrap_text=True)
-    thin   = Side(style='thin')
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    headers = ["Transect", "File", "Shot pos (m)",
-               "V1 right (m/s)", "V2 right (m/s)",
-               "t_i right (ms)", "Depth right (m)",
-               "V1 left (m/s)",  "V2 left (m/s)",
-               "t_i left (ms)",  "Depth left (m)",
-               "Depth avg (m)",  "Warnings"]
-    col_widths = [10, 24, 13, 14, 14, 14, 14, 13, 13, 13, 13, 13, 50]
-
-    for col, (h, w) in enumerate(zip(headers, col_widths), start=1):
-        cell           = ws.cell(row=1, column=col, value=h)
-        cell.font      = hdr_font
-        cell.fill      = hdr_fill
-        cell.alignment = hdr_align
-        cell.border    = border
-        ws.column_dimensions[get_column_letter(col)].width = w
-    ws.row_dimensions[1].height = 30
-
+    thin      = Side(style='thin')
+    border    = Border(left=thin, right=thin, top=thin, bottom=thin)
+    centre    = Alignment(horizontal="center")
     warn_fill = PatternFill("solid", fgColor="FCE4D6")
 
-    def _val(wing, key, decimals=2):
-        if wing is None:
-            return 'N/A'
-        v = wing.get(key, float('nan'))
-        return round(v, decimals) if not np.isnan(v) else 'N/A'
+    for col, (header, width) in enumerate(
+            zip(_HEADERS, _COL_WIDTHS), start=1):
+        cell           = ws.cell(row=1, column=col, value=header)
+        cell.font      = Font(bold=True, color="FFFFFF")
+        cell.fill      = PatternFill("solid", fgColor="2F5496")
+        cell.alignment = Alignment(horizontal="center", vertical="center",
+                                   wrap_text=True)
+        cell.border    = border
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.row_dimensions[1].height = 30
 
     for row_num, r in enumerate(results, start=2):
         res   = r['res']
         right = res.get('right')
         left  = res.get('left')
+        depths = [w['depth'] for w in filter(None, (right, left))]
+        d_avg  = float(np.nanmean(depths)) if depths else float('nan')
 
-        d_right = right['depth'] if right else float('nan')
-        d_left  = left['depth']  if left  else float('nan')
-        d_avg   = float(np.nanmean([d_right, d_left]))
-
-        values = [
-            r['transect_id'],
-            r['file_name'],
+        row_values = [
+            r['transect_id'], r['file_name'],
             round(res['true_shot_loc'], 3),
-            _val(right, 'v1', 1), _val(right, 'v2', 1),
-            _val(right, 't_i_ms', 3), _val(right, 'depth', 3),
-            _val(left,  'v1', 1), _val(left,  'v2', 1),
-            _val(left,  't_i_ms', 3), _val(left,  'depth', 3),
+            _wing_val(right, 'v1', 1), _wing_val(right, 'v2', 1),
+            _wing_val(right, 't_i_ms', 3), _wing_val(right, 'depth', 3),
+            _wing_val(left,  'v1', 1), _wing_val(left,  'v2', 1),
+            _wing_val(left,  't_i_ms', 3), _wing_val(left,  'depth', 3),
             round(d_avg, 3) if not np.isnan(d_avg) else 'N/A',
             ' | '.join(res.get('warnings', [])),
         ]
-
-        for col, val in enumerate(values, start=1):
-            cell           = ws.cell(row=row_num, column=col, value=val)
+        has_warnings = bool(res.get('warnings'))
+        for col, value in enumerate(row_values, start=1):
+            cell           = ws.cell(row=row_num, column=col, value=value)
             cell.border    = border
-            cell.alignment = Alignment(horizontal="center")
-
-        if res.get('warnings'):
-            for col in range(1, len(headers) + 1):
-                ws.cell(row=row_num, column=col).fill = warn_fill
+            cell.alignment = centre
+            if has_warnings:
+                cell.fill = warn_fill
 
     ws.auto_filter.ref = ws.dimensions
     ws.freeze_panes    = "A2"
@@ -726,13 +1111,13 @@ def save_excel(results, xlsx_path):
     print(f"  Excel saved → {xlsx_path}")
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Main
-# ---------------------------------------------------------------------------
-def main():
+# ===========================================================================
+
+def main() -> int:
     script_dir = Path(__file__).parent
     pick_dir   = script_dir / 'pick_files'
-    elev_dir   = script_dir / 'elevation_files'
     work_dir   = pick_dir if pick_dir.is_dir() else script_dir
 
     vs_files = sorted(work_dir.glob('*.vs'))
@@ -744,22 +1129,29 @@ def main():
     transects = group_by_transect(vs_files)
     print(f"Transects found: {list(transects.keys())}\n")
 
-    all_records: list = []
-    excel_rows:  list = []
+    # ── Elevation data from elev.csv ──────────────────────────────────────────
+    elev_data = read_elev_csv(script_dir / 'elev.csv')
+
+    # ── Geotech data from geotech.csv (optional) ──────────────────────────────
+    geotech_by_tid, sheetpile_by_tid = read_geotech_csv(
+        script_dir / 'geotech.csv')
+
+    # ── Process all shots ─────────────────────────────────────────────────────
+    all_records: list[dict] = []
 
     for tid, files in transects.items():
-        print(f"\n{'═'*60}")
+        print(f"\n{'═' * 60}")
         print(f"  TRANSECT  {tid}  ({len(files)} shots)")
-        print(f"{'═'*60}\n")
+        print(f"{'═' * 60}\n")
 
         for path in sorted(files):
-            print(f"  {'─'*50}")
+            print(f"  {'─' * 50}")
             print(f"  Processing : {path.name}")
 
             try:
                 shot_pos, distances, times_ms = read_vs_file(path)
-            except Exception as e:
-                print(f"  ✗ Read error: {e}")
+            except Exception as exc:
+                print(f"  ✗ Read error: {exc}")
                 continue
 
             if times_ms.size == 0:
@@ -768,8 +1160,8 @@ def main():
 
             try:
                 res = analyse_shot(distances, times_ms, shot_pos=shot_pos)
-            except Exception as e:
-                print(f"  ✗ Analysis error: {e}")
+            except Exception as exc:
+                print(f"  ✗ Analysis error: {exc}")
                 continue
 
             all_records.append(dict(
@@ -779,30 +1171,25 @@ def main():
                 times_ms      = times_ms,
                 res           = res,
             ))
-            excel_rows.append(dict(
-                transect_id = tid,
-                file_name   = path.name,
-                res         = res,
-            ))
 
     if not all_records:
-        print("\nNo files processed.")
+        print("\nNo files processed successfully.")
         return 1
 
-    print(f"\n{'═'*60}")
+    print(f"\n{'═' * 60}")
     print(f"Processed {len(all_records)} / {len(vs_files)} shots.\n")
 
-    tt_pdf    = script_dir / "refra_itm_traveltimes.pdf"
-    elev_pdf  = script_dir / "refra_itm_elevation.pdf"
-    xlsx_path = script_dir / "refra_itm_results.xlsx"
-
-    save_pdf(all_records, tt_pdf)
-    save_excel(excel_rows, xlsx_path)
-
-    if elev_dir.is_dir():
-        save_elevation_pdf(all_records, elev_dir, elev_pdf)
-    else:
-        print("  ⚠  elevation_files/ not found – skipping elevation PDF.")
+    save_traveltime_pdf(all_records,
+                        script_dir / "refra_itm_traveltimes.pdf")
+    save_excel(all_records,
+               script_dir / "refra_itm_results.xlsx")
+    save_elevation_pdf(
+        all_records,
+        elev_data,
+        script_dir / "refra_itm_elevation.pdf",
+        geotech_by_tid   = geotech_by_tid   or None,
+        sheetpile_by_tid = sheetpile_by_tid  or None,
+    )
 
     return 0
 
