@@ -17,10 +17,10 @@ SHEET_PILE_DEPTH = 18.0  # m below surface
 
 # Elevation plot axis limits – 1:1 aspect is enforced by set_aspect('equal').
 # x: 0 → 28 m  (28 m range)
-# y: -15 → +7 m (22 m range)  — clipped at -15 for readability
+# y: -18 → +7 m (25 m range)  — clipped at -18 for readability
 ELEV_X_MIN = 0.0
 ELEV_X_MAX = 28.0
-ELEV_Y_MIN = -15.0
+ELEV_Y_MIN = -18.0
 ELEV_Y_MAX = 7.0
 
 # Geotech style

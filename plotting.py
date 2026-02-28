@@ -6,7 +6,7 @@ import matplotlib.backends.backend_pdf as pdf_backend
 import numpy as np
 
 import config
-from analysis import ShotResult, collect_rock_points
+from analysis_itm import ShotResult, collect_rock_points
 from elevation import interpolate_elevation
 from geotech import GeotechPoint
 from io_helpers import SheetPileLine
@@ -144,40 +144,51 @@ def _draw_geotech_overlays(ax: plt.Axes,
                           f"(d={config.SHEET_PILE_DEPTH:.0f} m)")
 
     # ── Geotech tests ─────────────────────────────────────────────────────────
-    legend_added: set[str] = set()
+    # Colour map: test_type → (line_color, star_color, legend_label)
+    _STYLE: dict[str, tuple[str, str, str]] = {
+        'DPL':  (config.DPL_COLOR,  'goldenrod',  'DPL'),
+        'CPTU': (config.CPTU_COLOR, 'steelblue',  'CPTu'),
+    }
+
+    legend_line_added:  set[str] = set()
+    legend_rock_added:  set[str] = set()
 
     for pt in geotech_pts:
-        color  = (config.DPL_COLOR if pt.test_type.upper() == 'DPL'
-                  else config.CPTU_COLOR)
+        key        = pt.test_type.upper()
+        line_color, star_color, nice_label = _STYLE.get(
+            key, (config.CPTU_COLOR, 'steelblue', pt.test_type))
+
         z_surf = interpolate_elevation(elev_x, elev_z, pt.dist_x)
         if z_surf is None:
             continue
 
         z_bot = z_surf - pt.tested_depth
 
-        # Vertical test line
-        line_label = (pt.test_type
-                      if pt.test_type not in legend_added
+        # ── Vertical test line ────────────────────────────────────────────────
+        line_label = (nice_label
+                      if key not in legend_line_added
                       else '_nolegend_')
         ax.plot([pt.dist_x, pt.dist_x], [z_surf, z_bot],
-                color=color, linewidth=1.4, zorder=5, label=line_label)
-        legend_added.add(pt.test_type)
+                color=line_color, linewidth=1.4, zorder=5,
+                label=line_label)
+        legend_line_added.add(key)
 
-        # Rock marker + label (only when rock was encountered)
+        # ── Rock marker: star at rock depth ───────────────────────────────────
         if pt.depth_of_rock is not None:
-            z_rock      = z_surf - pt.depth_of_rock
-            rock_label  = ('Rock (geotech)'
-                           if 'Rock (geotech)' not in legend_added
-                           else '_nolegend_')
+            z_rock     = z_surf - pt.depth_of_rock
+            rock_key   = f'rock_{key}'
+            rock_label = (f'Rock ({nice_label})'
+                          if rock_key not in legend_rock_added
+                          else '_nolegend_')
             ax.scatter([pt.dist_x], [z_rock],
-                       color=color, marker='*',
+                       color=star_color, marker='*',
                        s=config.ROCK_MARKER_SIZE ** 2,
                        zorder=7, label=rock_label)
-            legend_added.add('Rock (geotech)')
+            legend_rock_added.add(rock_key)
             ax.annotate(f"{pt.depth_of_rock:.1f} m",
                         xy=(pt.dist_x, z_rock),
                         xytext=(4, 3), textcoords='offset points',
-                        fontsize=6, color=color, clip_on=True)
+                        fontsize=6, color=line_color, clip_on=True)
 
 
 def _draw_elevation_plot(ax: plt.Axes,
@@ -284,58 +295,65 @@ _TT_L, _TT_R  = 0.10, 0.97
 _TT_B, _TT_T  = 0.04, 0.97
 _TT_GAP       = 0.06
 
-# Elevation page: we must honour a 1:1 data aspect for a 28×22 m data window.
-# Data aspect ratio = 28 / 22 ≈ 1.273  (wider than tall in data units).
-# On A4 (8.27 in wide), usable width ≈ 7.5 in  → plot height ≈ 7.5/1.273 ≈ 5.89 in.
-# With two plots + gap on 11.69 in page:  2×5.89 + gap < 11.69  ✓ (gap ≈ 0.4 in)
-_ELEV_MARGIN_IN = 0.55   # inches on each side / top / bottom
-_ELEV_GAP_IN    = 0.50   # inches between the two plots
+# Elevation page layout constants (all in inches)
+_ELEV_MARGIN_L_IN  = 0.70   # left margin  (room for y-axis label)
+_ELEV_MARGIN_R_IN  = 0.30   # right margin
+_ELEV_MARGIN_T_IN  = 0.45   # top margin   (room for page top)
+_ELEV_MARGIN_B_IN  = 0.55   # bottom margin
+_ELEV_GAP_IN       = 0.90   # gap between bottom of upper plot
+                             # and top of lower plot  (title + y-label room)
+
+# Maximum fraction of A4 height the two plots + gap may occupy
+# (leaves _ELEV_MARGIN_T_IN + _ELEV_MARGIN_B_IN + _ELEV_GAP_IN around them)
+_ELEV_MAX_CONTENT_H_IN = (_A4_H
+                           - _ELEV_MARGIN_T_IN
+                           - _ELEV_MARGIN_B_IN
+                           - _ELEV_GAP_IN)
 
 
-def _elev_page_layout() -> tuple[plt.Figure,
-                                  list[plt.Axes]]:
+def _elev_page_layout() -> tuple[plt.Figure, list[plt.Axes]]:
     """
     Create one A4 figure with two elevation axes that each have a true
-    1:1 data-unit aspect ratio for the 28 m × 22 m data window.
+    1:1 data-unit aspect ratio for the configured data window.
 
     Returns (fig, [ax_top, ax_bottom]).
     """
-    data_w = config.ELEV_X_MAX - config.ELEV_X_MIN          # 28 m
-    data_h = config.ELEV_Y_MAX - config.ELEV_Y_MIN          # 22 m
-    aspect = data_w / data_h                   # ≈ 1.273
+    data_w = config.ELEV_X_MAX - config.ELEV_X_MIN   # e.g. 28 m
+    data_h = config.ELEV_Y_MAX - config.ELEV_Y_MIN   # e.g. 22 m
+    aspect = data_w / data_h                          # ≈ 1.273
 
-    usable_w_in = _A4_W - 2 * _ELEV_MARGIN_IN
+    usable_w_in = _A4_W - _ELEV_MARGIN_L_IN - _ELEV_MARGIN_R_IN
     plot_w_in   = usable_w_in
-    plot_h_in   = plot_w_in / aspect           # true 1:1 size
+    plot_h_in   = plot_w_in / aspect   # 1:1 unconstrained height
 
-    # Total height needed for two plots
-    total_h_in  = (2 * plot_h_in
-                   + _ELEV_GAP_IN
-                   + 2 * _ELEV_MARGIN_IN)
+    # If two plots + gap exceed the available content height, scale down
+    max_single_h = (_ELEV_MAX_CONTENT_H_IN - _ELEV_GAP_IN) / 2.0
+    if plot_h_in > max_single_h:
+        plot_h_in = max_single_h
+        plot_w_in = plot_h_in * aspect
 
-    # If it doesn't fit on A4, scale down proportionally
-    if total_h_in > _A4_H:
-        scale       = _A4_H / total_h_in
-        plot_w_in  *= scale
-        plot_h_in  *= scale
-
-    fig_h = max(_A4_H,
-                2 * plot_h_in + _ELEV_GAP_IN + 2 * _ELEV_MARGIN_IN)
-    fig   = plt.figure(figsize=(_A4_W, fig_h))
+    # Figure is exactly A4
+    fig = plt.figure(figsize=(_A4_W, _A4_H))
     fig.patch.set_facecolor('white')
 
-    # Convert to figure fractions
-    def _frac(inches: float) -> float:
-        return inches / fig_h
+    # Convert inches → figure fractions
+    def _fy(y_in: float) -> float:
+        return y_in / _A4_H
 
-    bot_lower = _frac(_ELEV_MARGIN_IN)
-    bot_upper = _frac(_ELEV_MARGIN_IN + plot_h_in + _ELEV_GAP_IN)
-    left_f    = _ELEV_MARGIN_IN / _A4_W
-    w_f       = plot_w_in / _A4_W
-    h_f       = _frac(plot_h_in)
+    def _fx(x_in: float) -> float:
+        return x_in / _A4_W
 
-    ax_bot = fig.add_axes([left_f, bot_lower, w_f, h_f])
-    ax_top = fig.add_axes([left_f, bot_upper, w_f, h_f])
+    h_f    = _fy(plot_h_in)
+    w_f    = _fx(plot_w_in)
+    left_f = _fx(_ELEV_MARGIN_L_IN)
+
+    # Bottom plot sits just above the bottom margin
+    bot_bot_f = _fy(_ELEV_MARGIN_B_IN)
+    # Top plot sits gap-inches above the top of the bottom plot
+    top_bot_f = _fy(_ELEV_MARGIN_B_IN + plot_h_in + _ELEV_GAP_IN)
+
+    ax_bot = fig.add_axes([left_f, bot_bot_f, w_f, h_f])
+    ax_top = fig.add_axes([left_f, top_bot_f, w_f, h_f])
 
     return fig, [ax_top, ax_bot]
 

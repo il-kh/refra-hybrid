@@ -9,7 +9,7 @@ Workflow
 3. Derive depth-to-refractor from the intercept-time formula.
 4. Export results to:
    - PDF  : travel-time plots  (refra_itm_traveltimes.pdf)
-   - PDF  : elevation + rock-depth profiles  (refra_itm_elevation.pdf)
+   - PDF  : elevation + rock-depth profiles  (sections.pdf)
    - XLSX : tabular summary  (refra_itm_results.xlsx)
 """
 
@@ -190,10 +190,10 @@ def _check_wing(wing: WingResult, label: str, warnings: list[str]) -> None:
 
 
 # ===========================================================================
-# Shot analyser
+# Shot analyser (ITM = Intercept Time Method)
 # ===========================================================================
 
-def analyse_shot(geophone_locs: np.ndarray,
+def analyse_shot_itm(geophone_locs: np.ndarray,
                  times_ms: np.ndarray,
                  shot_pos: Optional[float] = None) -> ShotResult:
     """

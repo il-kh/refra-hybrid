@@ -1,7 +1,7 @@
 from pathlib import Path
 from openpyxl import Workbook
 
-from analysis import WingResult
+from analysis_itm import WingResult
 
 import numpy as np
 from openpyxl import Workbook
