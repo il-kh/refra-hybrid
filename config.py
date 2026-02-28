@@ -34,3 +34,17 @@ DPL_COLOR:        str = 'darkorange'
 CPTU_COLOR:       str = 'royalblue'
 ROCK_MARKER_SIZE: int = 7
 SHEET_PILE_COLOR: str = 'black'
+
+# ===========================================================================
+# Plus-Minus (Hagedoorn) Method
+# ===========================================================================
+PM_MIN_SHOT_SEP     = 8.0    # minimum distance (m) between reciprocal shots
+PM_MIN_OVERLAP      = 4      # minimum geophones in refraction overlap zone
+PM_GEO_TOLERANCE    = 0.6    # tolerance (m) for matching geophone positions
+PM_EDGE_TRIM        = 2      # drop this many geophones at each edge of the
+                              # overlap zone to improve stability
+PM_TMINUS_R2_MIN    = 0.90   # minimum R² on T⁻ regression for V2 to be used
+PM_V1_FOR_DEPTH     = V1_PRIOR   # V1 used in depth conversion (CPTu prior)
+PM_V2_FLOOR_FACTOR  = 1.4    # T⁻ zone must yield V₂ > V1 × this factor;
+                              # otherwise it's the direct-wave zone, not
+                              # the refracted zone

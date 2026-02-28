@@ -7,6 +7,7 @@ import numpy as np
 
 import config
 from analysis_itm import ShotResult, collect_rock_points
+from analysis_plusminus import PMPairResult
 from elevation import interpolate_elevation
 from geotech import GeotechPoint
 from io_helpers import SheetPileLine
@@ -198,6 +199,7 @@ def _draw_elevation_plot(ax: plt.Axes,
                          title: str,
                          geotech_pts: Optional[list[GeotechPoint]] = None,
                          sheetpile: Optional[SheetPileLine] = None,
+                         pm_rock_points: Optional[list[dict]] = None,
                          ) -> None:
     """
     Ground-surface profile with ITM rock-depth points and geotech overlays.
@@ -264,6 +266,25 @@ def _draw_elevation_plot(ax: plt.Axes,
                         xy=(p['x_geo'], p['z_rock']),
                         xytext=(4, -10), textcoords='offset points',
                         fontsize=6.5, color='navy', clip_on=True)
+
+    # ── PM rock-depth points (triangles) ──────────────────────────────────────
+    if pm_rock_points:
+        pm_sorted = sorted(pm_rock_points, key=lambda p: p['x_geo'])
+        x_pm = np.array([p['x_geo']  for p in pm_sorted])
+        z_pm = np.array([p['z_rock'] for p in pm_sorted])
+
+        ax.plot(x_pm, z_pm,
+                color='purple', linestyle=':', linewidth=0.9,
+                alpha=0.6, zorder=3)
+        ax.scatter(x_pm, z_pm, color='darkorchid', marker='^',
+                   s=55, zorder=5, edgecolors='indigo', linewidths=0.5,
+                   label='PM rock depth')
+
+        for p in pm_sorted:
+            ax.annotate(f"{p['depth']:.1f}",
+                        xy=(p['x_geo'], p['z_rock']),
+                        xytext=(-4, -10), textcoords='offset points',
+                        fontsize=5.5, color='purple', clip_on=True)
 
     # ── Geotech overlays ──────────────────────────────────────────────────────
     # Pass the full (possibly extrapolated) x/z arrays so that
@@ -411,6 +432,8 @@ def save_elevation_pdf(records: list[dict],
                            dict[int, list[GeotechPoint]]] = None,
                        sheetpile_by_tid: Optional[
                            dict[int, SheetPileLine]] = None,
+                       pm_rock_by_tid: Optional[
+                           dict[int, list[dict]]] = None,
                        ) -> None:
     """
     Write one elevation + rock-depth profile per transect, two per A4 page.
@@ -451,11 +474,119 @@ def save_elevation_pdf(records: list[dict],
                     ax, elev_x, elev_z,
                     rock_by_tid.get(tid, []),
                     title=f"Transect {tid} — Ground profile & rock depth",
-                    geotech_pts = (geotech_by_tid or {}).get(tid),
-                    sheetpile   = (sheetpile_by_tid or {}).get(tid),
+                    geotech_pts    = (geotech_by_tid or {}).get(tid),
+                    sheetpile      = (sheetpile_by_tid or {}).get(tid),
+                    pm_rock_points = (pm_rock_by_tid or {}).get(tid),
                 )
 
             pdf.savefig(fig, bbox_inches='tight')
             plt.close(fig)
 
     print(f"  Elevation PDF saved → {pdf_path}")
+
+
+# ===========================================================================
+# Plus-Minus travel-time PDF
+# ===========================================================================
+
+def _draw_pm_traveltime_plot(ax: plt.Axes, pr: PMPairResult) -> None:
+    """T⁺ / T⁻ curves and V2 regression for one PM pair."""
+    geo = pr.geo_x
+
+    # T⁺ (depth-related)
+    ax.plot(geo, pr.t_plus_ms, 'o-', color='royalblue', markersize=4,
+            linewidth=1.2, label='T⁺ (depth)')
+
+    # T⁻ (velocity-related)
+    ax.plot(geo, pr.t_minus_ms, 's-', color='darkorange', markersize=4,
+            linewidth=1.2, label='T⁻ (V₂)')
+
+    # V2 regression line
+    if not np.isnan(pr.v2) and len(geo) >= 2:
+        from scipy.stats import linregress as _lr
+        slope, intercept, *_ = _lr(geo, pr.t_minus_ms / 1000.0)
+        fit_x = np.linspace(geo.min(), geo.max(), 100)
+        fit_t = (slope * fit_x + intercept) * 1000.0
+        ax.plot(fit_x, fit_t, '--', color='red', linewidth=1.0,
+                label=f'T⁻ fit  V₂={pr.v2:.0f} m/s  R²={pr.v2_r2:.3f}')
+
+    # Info box
+    valid_d = pr.depths[~np.isnan(pr.depths)]
+    info = (f"Pair: {pr.file_a} ↔ {pr.file_b}\n"
+            f"Shots: A={pr.shot_a:.1f} m  B={pr.shot_b:.1f} m  "
+            f"T_AB={pr.t_ab_ms:.2f} ms\n"
+            f"V₂ = {pr.v2:.0f} m/s  (R²={pr.v2_r2:.3f})")
+    if len(valid_d):
+        info += f"\nDepth: {valid_d.min():.2f}–{valid_d.max():.2f} m  "
+        info += f"(mean {valid_d.mean():.2f} m)"
+    ax.annotate(info, xy=(0.02, 0.97), xycoords='axes fraction',
+                fontsize=7, verticalalignment='top', family='monospace',
+                bbox=dict(boxstyle='round,pad=0.4',
+                          facecolor='lightyellow', alpha=0.9))
+
+    if pr.warnings:
+        ax.annotate('\n'.join(pr.warnings),
+                    xy=(0.02, 0.02), xycoords='axes fraction',
+                    fontsize=6.5, verticalalignment='bottom',
+                    color='darkred',
+                    bbox=dict(boxstyle='round,pad=0.4',
+                              facecolor='#FFE0E0', edgecolor='red',
+                              linewidth=1.2, alpha=0.95))
+
+    ax.set_xlabel('Geophone position (m)', fontsize=8)
+    ax.set_ylabel('Time (ms)', fontsize=8)
+    ax.set_title(f"PM  T {pr.file_a} ↔ {pr.file_b}", fontsize=8)
+    ax.legend(fontsize=6.5, loc='upper right')
+    ax.grid(True, alpha=0.4)
+
+
+def save_pm_traveltime_pdf(
+        pm_results: dict[int, list[PMPairResult]],
+        pdf_path: Path,
+) -> None:
+    """Write PM T⁺/T⁻ plots, two per A4 page, grouped by transect."""
+    plot_w = _TT_R - _TT_L
+    plot_h = (_TT_T - _TT_B - _TT_GAP) / 2.0
+    bottoms = [_TT_B + plot_h + _TT_GAP, _TT_B]
+
+    # Flatten to ordered list
+    pairs: list[tuple[int, PMPairResult]] = []
+    for tid in sorted(pm_results):
+        for pr in pm_results[tid]:
+            pairs.append((tid, pr))
+
+    if not pairs:
+        print("  No PM pairs — skipping PM traveltime PDF.")
+        return
+
+    with pdf_backend.PdfPages(pdf_path) as pdf:
+        prev_tid = None
+        i = 0
+        while i < len(pairs):
+            tid, _ = pairs[i]
+
+            if tid != prev_tid:
+                sep = plt.figure(figsize=(_A4_W, 0.8))
+                sep.text(0.5, 0.5, f"Transect  {tid}  —  Plus-Minus",
+                         ha='center', va='center',
+                         fontsize=14, fontweight='bold',
+                         transform=sep.transFigure)
+                pdf.savefig(sep, bbox_inches='tight')
+                plt.close(sep)
+                prev_tid = tid
+
+            fig = plt.figure(figsize=(_A4_W, _A4_H))
+            fig.patch.set_facecolor('white')
+
+            for slot in range(2):
+                if i >= len(pairs) or pairs[i][0] != tid:
+                    break
+                _, pr = pairs[i]
+                ax = fig.add_axes([_TT_L, bottoms[slot], plot_w, plot_h])
+                _draw_pm_traveltime_plot(ax, pr)
+                i += 1
+
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close(fig)
+
+    print(f"  PM travel-time PDF saved → {pdf_path}")

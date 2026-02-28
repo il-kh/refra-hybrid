@@ -2,6 +2,7 @@ from pathlib import Path
 from openpyxl import Workbook
 
 from analysis_itm import WingResult
+from analysis_plusminus import PMPairResult
 
 import numpy as np
 from openpyxl import Workbook
@@ -97,3 +98,88 @@ def save_excel(results: list[dict], xlsx_path: Path) -> None:
     ws.freeze_panes    = "A2"
     wb.save(xlsx_path)
     print(f"  Excel saved → {xlsx_path}")
+
+
+# ===========================================================================
+# Plus-Minus Excel writer
+# ===========================================================================
+
+_PM_HEADERS = [
+    "Transect", "Shot A", "Shot B",
+    "Shot A pos (m)", "Shot B pos (m)", "T_AB (ms)",
+    "V2 (m/s)", "V2 R²", "V1 used (m/s)",
+    "Geo X (m)", "Depth (m)", "z_rock (m ASL)",
+    "Warnings",
+]
+_PM_COL_WIDTHS = [10, 22, 22, 14, 14, 12, 12, 10, 12, 12, 12, 14, 50]
+
+
+def save_pm_excel(
+        pm_results: dict[int, list[PMPairResult]],
+        elev_data: dict[int, tuple[np.ndarray, np.ndarray]],
+        xlsx_path: Path,
+) -> None:
+    """Write Plus-Minus results to a formatted Excel workbook."""
+    from elevation import interpolate_elevation
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Plus-Minus Results"
+
+    thin   = Side(style='thin')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    centre = Alignment(horizontal="center")
+    warn_fill = PatternFill("solid", fgColor="FCE4D6")
+
+    for col, (header, width) in enumerate(
+            zip(_PM_HEADERS, _PM_COL_WIDTHS), start=1):
+        cell           = ws.cell(row=1, column=col, value=header)
+        cell.font      = Font(bold=True, color="FFFFFF")
+        cell.fill      = PatternFill("solid", fgColor="5B2C6F")
+        cell.alignment = Alignment(horizontal="center", vertical="center",
+                                   wrap_text=True)
+        cell.border    = border
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.row_dimensions[1].height = 30
+
+    row_num = 2
+    for tid in sorted(pm_results):
+        elev_x, elev_z = elev_data.get(tid, (np.array([]), np.array([])))
+        for pr in pm_results[tid]:
+            has_warn = bool(pr.warnings)
+            warn_str = ' | '.join(pr.warnings) if pr.warnings else ''
+
+            for i, (x, d) in enumerate(zip(pr.geo_x, pr.depths)):
+                z_rock = ''
+                if not np.isnan(d) and len(elev_x) > 0:
+                    z_s = interpolate_elevation(elev_x, elev_z, float(x))
+                    if z_s is not None:
+                        z_rock = round(z_s - d, 3)
+
+                row_values = [
+                    tid,
+                    pr.file_a if i == 0 else '',
+                    pr.file_b if i == 0 else '',
+                    round(pr.shot_a, 2) if i == 0 else '',
+                    round(pr.shot_b, 2) if i == 0 else '',
+                    round(pr.t_ab_ms, 2) if i == 0 else '',
+                    round(pr.v2, 1) if i == 0 and not np.isnan(pr.v2) else ('' if i else 'N/A'),
+                    round(pr.v2_r2, 4) if i == 0 and not np.isnan(pr.v2_r2) else '',
+                    round(pr.v1_used, 1) if i == 0 else '',
+                    round(float(x), 2),
+                    round(float(d), 3) if not np.isnan(d) else 'N/A',
+                    z_rock,
+                    warn_str if i == 0 else '',
+                ]
+                for col, value in enumerate(row_values, start=1):
+                    cell = ws.cell(row=row_num, column=col, value=value)
+                    cell.border    = border
+                    cell.alignment = centre
+                    if has_warn:
+                        cell.fill = warn_fill
+                row_num += 1
+
+    ws.auto_filter.ref = ws.dimensions
+    ws.freeze_panes    = "A2"
+    wb.save(xlsx_path)
+    print(f"  PM Excel saved → {xlsx_path}")

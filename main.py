@@ -41,8 +41,9 @@ from pathlib import Path
 import config
 from io_helpers import read_elev_csv, read_geotech_csv, read_vs_file, group_by_transect
 from analysis_itm import analyse_shot_itm
-from plotting import save_traveltime_pdf, save_elevation_pdf
-from results import save_excel
+from analysis_plusminus import analyse_transect_pm, collect_pm_rock_points
+from plotting import save_traveltime_pdf, save_elevation_pdf, save_pm_traveltime_pdf
+from results import save_excel, save_pm_excel
 from config import DATA_DIR
 
 def main() -> int:
@@ -79,9 +80,34 @@ def main() -> int:
         print("No files processed successfully.")
         return 1
 
+    # ── Plus-Minus analysis (per transect) ─────────────────────────
+    print("\n" + "=" * 60)
+    print("  PLUS-MINUS (HAGEDOORN) ANALYSIS")
+    print("=" * 60)
+
+    pm_results: dict[int, list] = {}
+    for tid, files in transects.items():
+        try:
+            pairs = analyse_transect_pm(files, tid)
+            if pairs:
+                pm_results[tid] = pairs
+        except Exception as exc:
+            print(f"  ⚠  PM error on transect {tid}: {exc}")
+
+    pm_rock_by_tid = collect_pm_rock_points(pm_results, elev_data)
+
+    # ── Output ─────────────────────────────────────────────────────
     save_traveltime_pdf(all_records, script_dir / "refra_itm_traveltimes.pdf")
     save_excel(all_records, script_dir / "refra_itm_results.xlsx")
-    save_elevation_pdf(all_records, elev_data, script_dir / "sections.pdf", geotech_by_tid, sheetpile_by_tid)
+    save_elevation_pdf(all_records, elev_data, script_dir / "sections.pdf",
+                       geotech_by_tid, sheetpile_by_tid,
+                       pm_rock_by_tid=pm_rock_by_tid)
+
+    if pm_results:
+        save_pm_traveltime_pdf(pm_results,
+                               script_dir / "refra_pm_traveltimes.pdf")
+        save_pm_excel(pm_results, elev_data,
+                      script_dir / "refra_pm_results.xlsx")
 
     return 0
 
