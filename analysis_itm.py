@@ -113,54 +113,111 @@ def _fit_wing(wing_geo: np.ndarray,
               min_points: int = config.MIN_SEGMENT_POINTS) -> WingResult:
     """
     Two-segment linear fit on one wing.
-    Returns a parameter dict, or None if the wing is too short.
+
+    V1 is regressed on **wing-local** near-offset points only (not the
+    full spread), eliminating cross-wing contamination from the other
+    wing's refracted arrivals.  When the wing-local V1 fit is unreliable
+    (non-positive slope, out-of-range velocity, or too few points) the
+    CPTu prior ``config.V1_PRIOR`` is used instead.
+
+    Returns a parameter dict with quality metrics, or None if the wing
+    is too short.
     """
     if len(wing_offsets) < 2 * min_points:
         return None
 
-    v2_local_start    = find_breakpoint_on_wing(
+    v2_local_start = find_breakpoint_on_wing(
         wing_offsets, wing_times_sec, min_points)
+
+    # ── Build full-array masks (for plotting) ──────────────────────────
     wing_full_indices = np.array(
         [np.where(full_geo == g)[0][0] for g in wing_geo])
-
     v2_mask = np.zeros(len(full_geo), dtype=bool)
     v2_mask[wing_full_indices[v2_local_start:]] = True
-    v1_mask = ~v2_mask
+    v1_mask = np.zeros(len(full_geo), dtype=bool)
+    v1_mask[wing_full_indices[:v2_local_start]] = True
 
-    slope2, intercept2, *_ = linregress(full_offsets[v2_mask],
-                                        full_times_sec[v2_mask])
-    slope1, intercept1, *_ = linregress(full_offsets[v1_mask],
-                                        full_times_sec[v1_mask])
+    # ── V2 regression (wing-local far-offset segment) ─────────────────
+    v2_off = wing_offsets[v2_local_start:]
+    v2_t   = wing_times_sec[v2_local_start:]
+    slope2, intercept2, r_v2, _, _ = linregress(v2_off, v2_t)
 
-    for name, sl in (('V1', slope1), ('V2', slope2)):
-        if sl <= 0:
-            print(f"    ⚠  [{side}] {name} slope non-positive "
-                  f"({sl:.6f}) – unreliable.")
+    if slope2 <= 0:
+        print(f"    ⚠  [{side}] V2 slope non-positive "
+              f"({slope2:.6f}) – unreliable.")
+        slope2 = abs(slope2)
 
-    slope1 = abs(slope1) if slope1 <= 0 else slope1
-    slope2 = abs(slope2) if slope2 <= 0 else slope2
+    # ── V1 regression (wing-local near-offset segment) ────────────────
+    v1_off = wing_offsets[:v2_local_start]
+    v1_t   = wing_times_sec[:v2_local_start]
+    v1_constrained = False
+    r_v1 = float('nan')
+
+    if len(v1_off) >= 2:
+        slope1, intercept1, r_v1, _, _ = linregress(v1_off, v1_t)
+        v1_from_fit = 1.0 / slope1 if slope1 > 0 else float('inf')
+        if slope1 <= 0 or not (config.V1_MIN <= v1_from_fit <= config.V1_MAX):
+            print(f"    ⚠  [{side}] V1 = {v1_from_fit:.0f} m/s unreliable "
+                  f"→ using CPTu prior {config.V1_PRIOR:.0f} m/s")
+            slope1 = 1.0 / config.V1_PRIOR
+            intercept1 = float(np.mean(v1_t - slope1 * v1_off))
+            v1_constrained = True
+            r_v1 = float('nan')
+    else:
+        print(f"    ⚠  [{side}] Only {len(v1_off)} V1 point(s) "
+              f"→ using CPTu prior {config.V1_PRIOR:.0f} m/s")
+        slope1 = 1.0 / config.V1_PRIOR
+        if len(v1_off) > 0:
+            intercept1 = float(np.mean(v1_t - slope1 * v1_off))
+        else:
+            intercept1 = 0.0
+        v1_constrained = True
 
     v1, v2 = 1.0 / slope1, 1.0 / slope2
     t_i    = intercept2
     depth  = (
         (t_i * v1 * v2) / (2.0 * np.sqrt(v2 ** 2 - v1 ** 2))
-        if v2 >= config.V2_ROCK_MIN and (v2 ** 2 - v1 ** 2) > 0
+        if v2 >= config.V2_ROCK_MIN and (v2 ** 2 - v1 ** 2) > 0 and t_i > 0
         else float('nan')
     )
 
+    # ── Quality metrics ────────────────────────────────────────────────
+    v2_count   = int(v2_mask.sum())
+    v1_count   = int(v1_mask.sum())
+    max_offset = float(wing_offsets.max())
+    r2_v1      = float(r_v1 ** 2) if not np.isnan(r_v1) else float('nan')
+    r2_v2      = float(r_v2 ** 2)
+
+    if v2 > v1 and not np.isnan(t_i) and t_i > 0:
+        xc_est   = t_i * v1 * v2 / (v2 - v1)
+        xc_ratio = max_offset / xc_est if xc_est > 0 else 0.0
+    else:
+        xc_est   = float('nan')
+        xc_ratio = 0.0
+
     return dict(
-        side       = side,
-        v1         = v1,
-        v2         = v2,
-        t_i_ms     = t_i * 1000.0,
-        depth      = depth,
-        slope1     = slope1,
-        intercept1 = intercept1,
-        slope2     = slope2,
-        intercept2 = intercept2,
-        bp_offset  = float(full_offsets[v2_mask].min()),
-        bp_geo     = 0.0,
-        v2_mask    = v2_mask,
+        side           = side,
+        v1             = v1,
+        v2             = v2,
+        t_i_ms         = t_i * 1000.0,
+        depth          = depth,
+        slope1         = slope1,
+        intercept1     = intercept1,
+        slope2         = slope2,
+        intercept2     = intercept2,
+        bp_offset      = float(v2_off.min()),
+        bp_geo         = 0.0,
+        v2_mask        = v2_mask,
+        v1_mask        = v1_mask,
+        # Quality metrics
+        v1_constrained = v1_constrained,
+        v2_count       = v2_count,
+        v1_count       = v1_count,
+        max_offset     = max_offset,
+        r2_v1          = r2_v1,
+        r2_v2          = r2_v2,
+        xc_est         = xc_est,
+        xc_ratio       = xc_ratio,
     )
 
 
@@ -169,7 +226,7 @@ def _fit_wing(wing_geo: np.ndarray,
 # ===========================================================================
 
 def _check_wing(wing: WingResult, label: str, warnings: list[str]) -> None:
-    """Append warning strings for out-of-range velocities."""
+    """Append warning strings for out-of-range velocities and quality issues."""
     if wing is None:
         return
     v1, v2 = wing['v1'], wing['v2']
@@ -182,6 +239,18 @@ def _check_wing(wing: WingResult, label: str, warnings: list[str]) -> None:
          f"[{config.V2_MIN:.0f}–{config.V2_MAX:.0f}]"),
         (v2 <= v1,
          f"⚠ {label} V2 ≤ V1 – refraction condition not met"),
+        (wing.get('t_i_ms', 0) <= 0,
+         f"⚠ {label} t_i = {wing.get('t_i_ms', 0):.1f} ms ≤ 0 "
+         f"– non-physical intercept time"),
+        (wing.get('v2_count', 0) < config.MIN_V2_POINTS,
+         f"⚠ {label} only {wing.get('v2_count', 0)} V2 points "
+         f"(need ≥ {config.MIN_V2_POINTS})"),
+        (0 < wing.get('xc_ratio', 0) < config.XC_COVERAGE_WARN,
+         f"⚠ {label} max offset covers only "
+         f"{wing.get('xc_ratio', 0):.0%} of crossover distance"),
+        (wing.get('v1_constrained', False),
+         f"ℹ {label} V1 constrained to CPTu prior "
+         f"{config.V1_PRIOR:.0f} m/s"),
     ]
     for condition, msg in checks:
         if condition:
@@ -237,10 +306,16 @@ def analyse_shot_itm(geophone_locs: np.ndarray,
             print("    Too few points – skipped.")
             return None
         result['bp_geo'] = true_shot_loc + sign * result['bp_offset']
+        xc_str = (f"{result['xc_ratio']:.0%}"
+                  if result['xc_ratio'] > 0 else "N/A")
+        constrained_tag = " [V1=CPTu]" if result.get('v1_constrained') else ""
         print(f"    V1={result['v1']:.1f}  V2={result['v2']:.1f} m/s  "
               f"t_i={result['t_i_ms']:.2f} ms  "
               f"z={result['depth']:.2f} m  "
-              f"BP@{result['bp_geo']:.1f} m")
+              f"BP@{result['bp_geo']:.1f} m  "
+              f"V2pts={result['v2_count']}  "
+              f"xc_cov={xc_str}"
+              f"{constrained_tag}")
         _check_wing(result, side.capitalize(), warnings)
         return result
 

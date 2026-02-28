@@ -13,7 +13,13 @@ V2_ROCK_MIN = 800.0
 BP_SLOPE_TOLERANCE = 1.20
 MIN_SEGMENT_POINTS = 3
 
+# ITM quality control — V1 prior and quality gates
+V1_PRIOR         = 350.0   # CPTu-constrained V1 fallback (m/s)
+MIN_V2_POINTS    = 4       # minimum V2 data points for reliable wing
+XC_COVERAGE_WARN = 1.0     # warn if max_offset / xc_est < this ratio
+
 SHEET_PILE_DEPTH = 18.0  # m below surface
+
 
 # Elevation plot axis limits – 1:1 aspect is enforced by set_aspect('equal').
 # x: 0 → 28 m  (28 m range)

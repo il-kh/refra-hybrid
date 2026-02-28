@@ -16,10 +16,12 @@ from openpyxl.utils import get_column_letter
 _HEADERS = [
     "Transect", "File", "Shot pos (m)",
     "V1 right (m/s)", "V2 right (m/s)", "t_i right (ms)", "Depth right (m)",
+    "V2 pts R", "xc cov R (%)",
     "V1 left (m/s)",  "V2 left (m/s)",  "t_i left (ms)",  "Depth left (m)",
+    "V2 pts L", "xc cov L (%)",
     "Depth avg (m)", "Warnings",
 ]
-_COL_WIDTHS = [10, 24, 13, 14, 14, 14, 14, 13, 13, 13, 13, 13, 50]
+_COL_WIDTHS = [10, 24, 13, 14, 14, 14, 14, 9, 12, 13, 13, 13, 13, 9, 12, 13, 50]
 
 
 def _wing_val(wing: WingResult, key: str, decimals: int = 2):
@@ -30,6 +32,16 @@ def _wing_val(wing: WingResult, key: str, decimals: int = 2):
     if isinstance(val, float):
         return round(val, decimals) if not np.isnan(val) else 'N/A'
     return val
+
+
+def _wing_pct(wing: WingResult, key: str):
+    """Format a ratio as a percentage integer, or 'N/A'."""
+    if wing is None:
+        return 'N/A'
+    val = wing.get(key, 0.0)
+    if val == 0 or np.isnan(val):
+        return 'N/A'
+    return round(float(val) * 100)
 
 
 def save_excel(results: list[dict], xlsx_path: Path) -> None:
@@ -66,8 +78,10 @@ def save_excel(results: list[dict], xlsx_path: Path) -> None:
             round(res['true_shot_loc'], 3),
             _wing_val(right, 'v1', 1), _wing_val(right, 'v2', 1),
             _wing_val(right, 't_i_ms', 3), _wing_val(right, 'depth', 3),
+            _wing_val(right, 'v2_count', 0), _wing_pct(right, 'xc_ratio'),
             _wing_val(left,  'v1', 1), _wing_val(left,  'v2', 1),
             _wing_val(left,  't_i_ms', 3), _wing_val(left,  'depth', 3),
+            _wing_val(left, 'v2_count', 0), _wing_pct(left, 'xc_ratio'),
             round(d_avg, 3) if not np.isnan(d_avg) else 'N/A',
             ' | '.join(res.get('warnings', [])),
         ]
