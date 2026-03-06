@@ -62,3 +62,23 @@ PM_DEPTH_MAX            = 16.0         # (m) max plausible depth
 PM_RIVER_X              = 18.0         # geophones at x > this are "near river"
 PM_DEPTH_MIN_RIVER      = 0.3          # (m) relaxed min depth near river
 PM_AGG_BIN_WIDTH        = 1.0          # (m) x-bin width for median aggregation
+
+# ===========================================================================
+# Section / elevation plot display controls
+# ===========================================================================
+# For each analysis, set show=True/False and a minimum depth (m).
+# Rock or refractor points shallower than the threshold are hidden.
+SHOW_ITM_RIGHT         = False   # ITM rock depth (right wing)
+ITM_RIGHT_DEPTH_MIN    = 2.0     # m – hide right-wing points shallower than this
+ITM_RIGHT_X_MIN        = 15.0    # m – hide right-wing points left of this 
+ITM_RIGHT_X_MAX        = 24.0    # m – hide right-wing points right of this 
+
+SHOW_ITM_LEFT          = True    # ITM rock depth (left wing)
+ITM_LEFT_DEPTH_MIN     = 0.0     # m – hide left-wing points shallower than this
+ITM_LEFT_X_MIN         = 15.0    # m – hide left-wing points left of this 
+ITM_LEFT_X_MAX         = 24.0    # m – hide left-wing points right of this 
+
+SHOW_PM_REFRACTOR      = True    # PM shallow refractor
+PM_REFRACTOR_DEPTH_MIN = 6.0     # m – hide PM points shallower than this
+PM_REFRACTOR_X_MIN     = 15.0    # m – hide PM points left of this 
+PM_REFRACTOR_X_MAX     = 24.0    # m – hide PM points right of this 

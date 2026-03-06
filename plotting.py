@@ -242,11 +242,23 @@ def _draw_elevation_plot(ax: plt.Axes,
                     linestyle=':', alpha=0.6)   # dotted = extrapolated
 
     # ── ITM rock-depth points ─────────────────────────────────────────────────
-    if rock_points:
-        pts    = sorted(rock_points, key=lambda p: p['x_geo'])
-        x_rock = np.array([p['x_geo']  for p in pts])
-        z_rock = np.array([p['z_rock'] for p in pts])
+    # Determine which sides are visible and what their depth thresholds are.
+    _itm_cfg = {
+        'right': (config.SHOW_ITM_RIGHT, config.ITM_RIGHT_DEPTH_MIN),
+        'left':  (config.SHOW_ITM_LEFT,  config.ITM_LEFT_DEPTH_MIN),
+    }
 
+    def _itm_visible(p: dict) -> bool:
+        show, dmin = _itm_cfg.get(p['side'], (False, 0.0))
+        return bool(show) and p['depth'] >= dmin
+
+    visible_itm = [p for p in sorted(rock_points or [], key=lambda p: p['x_geo'])
+                   if _itm_visible(p)]
+
+    if visible_itm:
+        # Connecting line through all visible ITM points
+        x_rock = np.array([p['x_geo']  for p in visible_itm])
+        z_rock = np.array([p['z_rock'] for p in visible_itm])
         ax.plot(x_rock, z_rock,
                 color='dimgray', linestyle='--', linewidth=0.9,
                 alpha=0.6, zorder=3)
@@ -255,13 +267,13 @@ def _draw_elevation_plot(ax: plt.Axes,
                 ('right', 'steelblue', 'ITM rock (right wing)'),
                 ('left',  'darkgreen', 'ITM rock (left wing)'),
         ):
-            xs = [p['x_geo']  for p in pts if p['side'] == side]
-            zs = [p['z_rock'] for p in pts if p['side'] == side]
+            xs = [p['x_geo']  for p in visible_itm if p['side'] == side]
+            zs = [p['z_rock'] for p in visible_itm if p['side'] == side]
             if xs:
                 ax.scatter(xs, zs, color=color, marker='D',
                            s=55, zorder=5, label=label)
 
-        for p in pts:
+        for p in visible_itm:
             ax.annotate(f"{p['depth']:.1f} m",
                         xy=(p['x_geo'], p['z_rock']),
                         xytext=(4, -10), textcoords='offset points',
@@ -270,8 +282,17 @@ def _draw_elevation_plot(ax: plt.Axes,
     # ── PM refractor points (triangles, median-aggregated) ──────────────────
     # NOTE: this is the shallow refractor (V₂ ≈ 870 m/s), NOT rock.
     # See analysis_plusminus module docstring for the three-layer explanation.
-    if pm_rock_points:
-        pm_sorted = sorted(pm_rock_points, key=lambda p: p['x_geo'])
+    if pm_rock_points and config.SHOW_PM_REFRACTOR:
+        pm_sorted = [
+            p for p in sorted(pm_rock_points, key=lambda p: p['x_geo'])
+            if p['depth'] >= config.PM_REFRACTOR_DEPTH_MIN
+        ]
+        if not pm_sorted:
+            pm_sorted = None  # fall through to skip block
+    else:
+        pm_sorted = None
+
+    if pm_sorted:
         x_pm = np.array([p['x_geo']  for p in pm_sorted])
         z_pm = np.array([p['z_rock'] for p in pm_sorted])
 
@@ -401,16 +422,7 @@ def save_traveltime_pdf(records: list[dict], pdf_path: Path) -> None:
         i = 0
         while i < len(records):
             tid = records[i]['transect_id']
-
-            if tid != prev_tid:
-                sep = plt.figure(figsize=(_A4_W, 0.8))
-                sep.text(0.5, 0.5, f"Transect  {tid}",
-                         ha='center', va='center',
-                         fontsize=14, fontweight='bold',
-                         transform=sep.transFigure)
-                pdf.savefig(sep, bbox_inches='tight')
-                plt.close(sep)
-                prev_tid = tid
+            prev_tid = tid
 
             fig = plt.figure(figsize=(_A4_W, _A4_H))
             fig.patch.set_facecolor('white')
@@ -425,7 +437,7 @@ def save_traveltime_pdf(records: list[dict], pdf_path: Path) -> None:
                     title=f"Refraction ITM – {r['file_name']}")
                 i += 1
 
-            pdf.savefig(fig, bbox_inches='tight')
+            pdf.savefig(fig)
             plt.close(fig)
 
     print(f"  Travel-time PDF saved → {pdf_path}")
@@ -485,7 +497,7 @@ def save_elevation_pdf(records: list[dict],
                     pm_rock_points = (pm_rock_by_tid or {}).get(tid),
                 )
 
-            pdf.savefig(fig, bbox_inches='tight')
+            pdf.savefig(fig)
             plt.close(fig)
 
     print(f"  Elevation PDF saved → {pdf_path}")
@@ -570,16 +582,7 @@ def save_pm_traveltime_pdf(
         i = 0
         while i < len(pairs):
             tid, _ = pairs[i]
-
-            if tid != prev_tid:
-                sep = plt.figure(figsize=(_A4_W, 0.8))
-                sep.text(0.5, 0.5, f"Transect  {tid}  —  Plus-Minus",
-                         ha='center', va='center',
-                         fontsize=14, fontweight='bold',
-                         transform=sep.transFigure)
-                pdf.savefig(sep, bbox_inches='tight')
-                plt.close(sep)
-                prev_tid = tid
+            prev_tid = tid
 
             fig = plt.figure(figsize=(_A4_W, _A4_H))
             fig.patch.set_facecolor('white')
@@ -592,7 +595,7 @@ def save_pm_traveltime_pdf(
                 _draw_pm_traveltime_plot(ax, pr)
                 i += 1
 
-            pdf.savefig(fig, bbox_inches='tight')
+            pdf.savefig(fig)
             plt.close(fig)
 
     print(f"  PM travel-time PDF saved → {pdf_path}")
