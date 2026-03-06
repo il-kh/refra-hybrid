@@ -35,6 +35,11 @@ CPTU_COLOR:       str = 'royalblue'
 ROCK_MARKER_SIZE: int = 7
 SHEET_PILE_COLOR: str = 'black'
 
+# Ground water line and date (y-value in elevation plot )
+GWL_Y = 2.5
+GWL_DATE = "2026-02-27"
+
+
 # ===========================================================================
 # Plus-Minus (Hagedoorn) Method
 # ===========================================================================
@@ -66,8 +71,7 @@ PM_AGG_BIN_WIDTH        = 1.0          # (m) x-bin width for median aggregation
 # ===========================================================================
 # Section / elevation plot display controls
 # ===========================================================================
-# For each analysis, set show=True/False and a minimum depth (m).
-# Rock or refractor points shallower than the threshold are hidden.
+# For each analysis, set show=True/False, minimum depth (m), and x-range (m).
 SHOW_ITM_RIGHT         = False   # ITM rock depth (right wing)
 ITM_RIGHT_DEPTH_MIN    = 2.0     # m – hide right-wing points shallower than this
 ITM_RIGHT_X_MIN        = 15.0    # m – hide right-wing points left of this 
@@ -82,3 +86,4 @@ SHOW_PM_REFRACTOR      = True    # PM shallow refractor
 PM_REFRACTOR_DEPTH_MIN = 6.0     # m – hide PM points shallower than this
 PM_REFRACTOR_X_MIN     = 15.0    # m – hide PM points left of this 
 PM_REFRACTOR_X_MAX     = 24.0    # m – hide PM points right of this 
+

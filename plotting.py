@@ -4,6 +4,7 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import matplotlib.backends.backend_pdf as pdf_backend
 import numpy as np
+from scipy.interpolate import CubicSpline, interp1d
 
 import config
 from analysis_itm import ShotResult, collect_rock_points
@@ -192,6 +193,50 @@ def _draw_geotech_overlays(ax: plt.Axes,
                         fontsize=6, color=line_color, clip_on=True)
 
 
+def _spline_segments(
+        xs: np.ndarray,
+        zs: np.ndarray,
+        barriers: set[float],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Split (xs, zs) into curve segments at any barrier x-value that falls
+    strictly between two consecutive data points, then return (x_dense,
+    z_dense) pairs for each segment as a smooth interpolating curve.
+
+    Uses CubicSpline for ≥4 points, quadratic interp1d for exactly 3,
+    and linear interpolation for 2 points.
+    A barrier coinciding exactly with a data-point x-value does not split
+    the segment (the point is kept, but no curve crosses the barrier line).
+    """
+    if len(xs) < 2:
+        return []
+
+    segments: list[list[tuple[float, float]]] = [[(xs[0], zs[0])]]
+    for i in range(1, len(xs)):
+        x_prev, x_cur = xs[i - 1], xs[i]
+        lo, hi = min(x_prev, x_cur), max(x_prev, x_cur)
+        if any(lo < b < hi for b in barriers):
+            segments.append([])          # barrier crossed – start new segment
+        segments[-1].append((xs[i], zs[i]))
+
+    results: list[tuple[np.ndarray, np.ndarray]] = []
+    for seg in segments:
+        if len(seg) < 2:
+            continue
+        sx = np.array([p[0] for p in seg])
+        sz = np.array([p[1] for p in seg])
+        x_dense = np.linspace(sx[0], sx[-1], 300)
+        n = len(seg)
+        if n >= 4:
+            z_dense = CubicSpline(sx, sz)(x_dense)
+        elif n == 3:
+            z_dense = interp1d(sx, sz, kind='quadratic')(x_dense)
+        else:                               # n == 2 → linear
+            z_dense = np.interp(x_dense, sx, sz)
+        results.append((x_dense, z_dense))
+    return results
+
+
 def _draw_elevation_plot(ax: plt.Axes,
                          elev_x: np.ndarray,
                          elev_z: np.ndarray,
@@ -241,27 +286,38 @@ def _draw_elevation_plot(ax: plt.Axes,
                     color='saddlebrown', linewidth=1.2,
                     linestyle=':', alpha=0.6)   # dotted = extrapolated
 
+    # ── Barrier x-positions: geotech tests where NO rock was found ──────────────
+    # The connecting spline must not be drawn across these x-positions.
+    barriers: set[float] = {
+        pt.dist_x
+        for pt in (geotech_pts or [])
+        if pt.depth_of_rock is None
+    }
+
     # ── ITM rock-depth points ─────────────────────────────────────────────────
-    # Determine which sides are visible and what their depth thresholds are.
+    # Determine which sides are visible and what their depth/x thresholds are.
     _itm_cfg = {
-        'right': (config.SHOW_ITM_RIGHT, config.ITM_RIGHT_DEPTH_MIN),
-        'left':  (config.SHOW_ITM_LEFT,  config.ITM_LEFT_DEPTH_MIN),
+        'right': (config.SHOW_ITM_RIGHT, config.ITM_RIGHT_DEPTH_MIN,
+                  config.ITM_RIGHT_X_MIN, config.ITM_RIGHT_X_MAX),
+        'left':  (config.SHOW_ITM_LEFT,  config.ITM_LEFT_DEPTH_MIN,
+                  config.ITM_LEFT_X_MIN,  config.ITM_LEFT_X_MAX),
     }
 
     def _itm_visible(p: dict) -> bool:
-        show, dmin = _itm_cfg.get(p['side'], (False, 0.0))
-        return bool(show) and p['depth'] >= dmin
+        show, dmin, xmin, xmax = _itm_cfg.get(p['side'], (False, 0.0, -np.inf, np.inf))
+        return bool(show) and p['depth'] >= dmin and xmin <= p['x_geo'] <= xmax
 
     visible_itm = [p for p in sorted(rock_points or [], key=lambda p: p['x_geo'])
                    if _itm_visible(p)]
 
     if visible_itm:
-        # Connecting line through all visible ITM points
         x_rock = np.array([p['x_geo']  for p in visible_itm])
         z_rock = np.array([p['z_rock'] for p in visible_itm])
-        ax.plot(x_rock, z_rock,
-                color='dimgray', linestyle='--', linewidth=0.9,
-                alpha=0.6, zorder=3)
+        # Spline connecting line, broken at any no-rock geotech barrier
+        for x_seg, z_seg in _spline_segments(x_rock, z_rock, barriers):
+            ax.plot(x_seg, z_seg,
+                    color='dimgray', linestyle='--', linewidth=0.9,
+                    alpha=0.6, zorder=3)
 
         for side, color, label in (
                 ('right', 'steelblue', 'ITM rock (right wing)'),
@@ -285,7 +341,8 @@ def _draw_elevation_plot(ax: plt.Axes,
     if pm_rock_points and config.SHOW_PM_REFRACTOR:
         pm_sorted = [
             p for p in sorted(pm_rock_points, key=lambda p: p['x_geo'])
-            if p['depth'] >= config.PM_REFRACTOR_DEPTH_MIN
+            if (p['depth'] >= config.PM_REFRACTOR_DEPTH_MIN
+                and config.PM_REFRACTOR_X_MIN <= p['x_geo'] <= config.PM_REFRACTOR_X_MAX)
         ]
         if not pm_sorted:
             pm_sorted = None  # fall through to skip block
@@ -300,9 +357,11 @@ def _draw_elevation_plot(ax: plt.Axes,
         med_v2 = np.median([p.get('v2_median', 0) for p in pm_sorted])
         lbl = f'PM refractor (V\u2082\u2248{med_v2:.0f} m/s)'
 
-        ax.plot(x_pm, z_pm,
-                color='purple', linestyle='-', linewidth=1.2,
-                alpha=0.7, zorder=3)
+        # Spline connecting line, broken at any no-rock geotech barrier
+        for x_seg, z_seg in _spline_segments(x_pm, z_pm, barriers):
+            ax.plot(x_seg, z_seg,
+                    color='purple', linestyle='-', linewidth=1.2,
+                    alpha=0.7, zorder=3)
         ax.scatter(x_pm, z_pm, color='darkorchid', marker='^',
                    s=65, zorder=5, edgecolors='indigo', linewidths=0.5,
                    label=lbl)
@@ -374,8 +433,10 @@ def _elev_page_layout() -> tuple[plt.Figure, list[plt.Axes]]:
     plot_w_in   = usable_w_in
     plot_h_in   = plot_w_in / aspect   # 1:1 unconstrained height
 
-    # If two plots + gap exceed the available content height, scale down
-    max_single_h = (_ELEV_MAX_CONTENT_H_IN - _ELEV_GAP_IN) / 2.0
+    # Cap plot height so that two plots + gap fit between minimum margins.
+    # Subtracting 2×GAP is intentionally conservative (leaves title room).
+    max_single_h = (_A4_H - _ELEV_MARGIN_T_IN - _ELEV_MARGIN_B_IN
+                    - 2.0 * _ELEV_GAP_IN) / 2.0
     if plot_h_in > max_single_h:
         plot_h_in = max_single_h
         plot_w_in = plot_h_in * aspect
@@ -391,14 +452,24 @@ def _elev_page_layout() -> tuple[plt.Figure, list[plt.Axes]]:
     def _fx(x_in: float) -> float:
         return x_in / _A4_W
 
-    h_f    = _fy(plot_h_in)
-    w_f    = _fx(plot_w_in)
-    left_f = _fx(_ELEV_MARGIN_L_IN)
+    h_f = _fy(plot_h_in)
+    w_f = _fx(plot_w_in)
 
-    # Bottom plot sits just above the bottom margin
-    bot_bot_f = _fy(_ELEV_MARGIN_B_IN)
-    # Top plot sits gap-inches above the top of the bottom plot
-    top_bot_f = _fy(_ELEV_MARGIN_B_IN + plot_h_in + _ELEV_GAP_IN)
+    # Horizontal centering: place (y-label margin + plot + right margin)
+    # block in the centre of the A4 width.
+    total_block_w = _ELEV_MARGIN_L_IN + plot_w_in + _ELEV_MARGIN_R_IN
+    left_edge_in  = max(0.0, (_A4_W - total_block_w) / 2.0)
+    left_f = _fx(left_edge_in + _ELEV_MARGIN_L_IN)
+
+    # Vertical centering: distribute remaining space evenly above and below
+    # the two-plots-plus-gap block, respecting minimum title/xlabel margins.
+    content_h_in = 2.0 * plot_h_in + _ELEV_GAP_IN
+    available_h  = _A4_H - _ELEV_MARGIN_T_IN - _ELEV_MARGIN_B_IN
+    extra_v      = max(0.0, available_h - content_h_in)
+    bot_in       = _ELEV_MARGIN_B_IN + extra_v / 2.0
+
+    bot_bot_f = _fy(bot_in)
+    top_bot_f = _fy(bot_in + plot_h_in + _ELEV_GAP_IN)
 
     ax_bot = fig.add_axes([left_f, bot_bot_f, w_f, h_f])
     ax_top = fig.add_axes([left_f, top_bot_f, w_f, h_f])
