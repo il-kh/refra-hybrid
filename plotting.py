@@ -4,7 +4,7 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import matplotlib.backends.backend_pdf as pdf_backend
 import numpy as np
-from scipy.interpolate import CubicSpline, interp1d
+from scipy.interpolate import UnivariateSpline
 
 import config
 from analysis_itm import ShotResult, collect_rock_points
@@ -193,28 +193,34 @@ def _draw_geotech_overlays(ax: plt.Axes,
                         fontsize=6, color=line_color, clip_on=True)
 
 
-def _spline_segments(
+def _smoothing_curve(
         xs: np.ndarray,
         zs: np.ndarray,
+        smoothing: float,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """
-    Return a single smooth interpolating curve through all (xs, zs) points.
+    Fit a smoothing spline through (xs, zs) and return a dense (x, z) curve.
 
-    Uses CubicSpline for ≥4 points, quadratic interp1d for exactly 3,
-    and linear interpolation for 2 points.  Returns a list with one
-    (x_dense, z_dense) tuple (or empty list if fewer than 2 points).
+    smoothing = 0  →  exact interpolation (passes through every point).
+    Higher values produce progressively smoother curves
+    (scipy UnivariateSpline s-parameter = sum-of-squared-residuals budget).
+
+    Duplicate x-values are collapsed by averaging their z before fitting.
+    Degree is automatically reduced for fewer than 4 unique points.
+    Returns an empty list when fewer than 2 unique x-values are present.
     """
-    n = len(xs)
+    if len(xs) < 2:
+        return []
+    # Collapse duplicate x-positions by averaging z
+    ux, inv = np.unique(xs, return_inverse=True)
+    uz = np.array([zs[inv == i].mean() for i in range(len(ux))])
+    n = len(ux)
     if n < 2:
         return []
-    x_dense = np.linspace(xs[0], xs[-1], 300)
-    if n >= 4:
-        z_dense = CubicSpline(xs, zs)(x_dense)
-    elif n == 3:
-        z_dense = interp1d(xs, zs, kind='quadratic')(x_dense)
-    else:                               # n == 2 → linear
-        z_dense = np.interp(x_dense, xs, zs)
-    return [(x_dense, z_dense)]
+    x_dense = np.linspace(ux[0], ux[-1], 300)
+    k = min(3, n - 1)          # cubic for ≥4 pts, quadratic for 3, linear for 2
+    spl = UnivariateSpline(ux, uz, k=k, s=smoothing)
+    return [(x_dense, spl(x_dense))]
 
 
 def _draw_elevation_plot(ax: plt.Axes,
@@ -294,16 +300,14 @@ def _draw_elevation_plot(ax: plt.Axes,
     visible_itm = [p for p in sorted(rock_points or [], key=lambda p: p['x_geo'])
                    if _itm_visible(p)]
 
-    if visible_itm:
-        x_rock = np.array([p['x_geo']  for p in visible_itm])
-        z_rock = np.array([p['z_rock'] for p in visible_itm])
+    if visible_itm or geo_rock_pts:
         # Build combined point set: seismic ITM + geotech rock, sorted by x
         combined = sorted(
             [(p['x_geo'], p['z_rock']) for p in visible_itm] + geo_rock_pts
         )
         cx = np.array([p[0] for p in combined])
         cz = np.array([p[1] for p in combined])
-        for x_seg, z_seg in _spline_segments(cx, cz):
+        for x_seg, z_seg in _smoothing_curve(cx, cz, config.ROCK_SPLINE_SMOOTHING):
             ax.plot(x_seg, z_seg,
                     color='dimgray', linestyle='--', linewidth=0.9,
                     alpha=0.6, zorder=3)
@@ -352,7 +356,7 @@ def _draw_elevation_plot(ax: plt.Axes,
         )
         cpx = np.array([p[0] for p in combined_pm])
         cpz = np.array([p[1] for p in combined_pm])
-        for x_seg, z_seg in _spline_segments(cpx, cpz):
+        for x_seg, z_seg in _smoothing_curve(cpx, cpz, config.ROCK_SPLINE_SMOOTHING):
             ax.plot(x_seg, z_seg,
                     color='purple', linestyle='-', linewidth=1.2,
                     alpha=0.7, zorder=3)

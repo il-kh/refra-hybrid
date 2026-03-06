@@ -85,5 +85,13 @@ ITM_LEFT_X_MAX         = 24.0    # m – hide left-wing points right of this
 SHOW_PM_REFRACTOR      = True    # PM shallow refractor
 PM_REFRACTOR_DEPTH_MIN = 6.0     # m – hide PM points shallower than this
 PM_REFRACTOR_X_MIN     = 15.0    # m – hide PM points left of this 
-PM_REFRACTOR_X_MAX     = 24.0    # m – hide PM points right of this 
+PM_REFRACTOR_X_MAX     = 24.0    # m – hide PM points right of this
+
+# Smoothing spline for the rock-depth profile curve
+# Uses scipy UnivariateSpline(k=3, s=ROCK_SPLINE_SMOOTHING).
+# s = 0.0  → exact interpolation through every data point.
+# Higher s → progressively smoother curve (residuals allowed).
+# Rule of thumb: s ≈ n   light smoothing (n = number of data points)
+#                s ≈ 4n  heavy smoothing
+ROCK_SPLINE_SMOOTHING  = 15.0     # m²  (sum-of-squared-residuals budget) 
 
