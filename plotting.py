@@ -267,18 +267,24 @@ def _draw_elevation_plot(ax: plt.Axes,
                         xytext=(4, -10), textcoords='offset points',
                         fontsize=6.5, color='navy', clip_on=True)
 
-    # ── PM rock-depth points (triangles) ──────────────────────────────────────
+    # ── PM refractor points (triangles, median-aggregated) ──────────────────
+    # NOTE: this is the shallow refractor (V₂ ≈ 870 m/s), NOT rock.
+    # See analysis_plusminus module docstring for the three-layer explanation.
     if pm_rock_points:
         pm_sorted = sorted(pm_rock_points, key=lambda p: p['x_geo'])
         x_pm = np.array([p['x_geo']  for p in pm_sorted])
         z_pm = np.array([p['z_rock'] for p in pm_sorted])
 
+        # Compute median V₂ across all bins for the legend
+        med_v2 = np.median([p.get('v2_median', 0) for p in pm_sorted])
+        lbl = f'PM refractor (V\u2082\u2248{med_v2:.0f} m/s)'
+
         ax.plot(x_pm, z_pm,
-                color='purple', linestyle=':', linewidth=0.9,
-                alpha=0.6, zorder=3)
+                color='purple', linestyle='-', linewidth=1.2,
+                alpha=0.7, zorder=3)
         ax.scatter(x_pm, z_pm, color='darkorchid', marker='^',
-                   s=55, zorder=5, edgecolors='indigo', linewidths=0.5,
-                   label='PM rock depth')
+                   s=65, zorder=5, edgecolors='indigo', linewidths=0.5,
+                   label=lbl)
 
         for p in pm_sorted:
             ax.annotate(f"{p['depth']:.1f}",

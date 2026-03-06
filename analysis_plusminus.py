@@ -18,7 +18,23 @@ first arrivals):
 
     V₂  =  2 / slope(T⁻ vs x)             (true refractor velocity)
     zᵢ  =  T⁺ᵢ · V₁ · V₂ / (2 √(V₂² − V₁²))   (depth at geophone i)
-"""
+Three-layer limitation
+----------------------
+The standard PM two-layer analysis resolves only the SHALLOWEST
+velocity contrast that produces head-wave first arrivals.  On this
+site the subsurface has at least three layers:
+
+    Layer 1  V₁ ≈ 350 m/s   (loose alluvium)            0–3 m
+    Layer 2  V₂ ≈ 870 m/s   (stiff clay / dense sand)   3–7+ m
+    Layer 3  V₃ > 2000 m/s  (boulders / bedrock)        7–19 m
+
+For geophones between two shots on the array, the first arrivals
+are refracted along the Layer-1/Layer-2 boundary.  The deeper
+Layer-2/Layer-3 (rock) head waves arrive LATER and are invisible
+to first-arrival picking.  Therefore **the PM depths reported here
+represent the shallow refractor (compaction boundary), NOT the
+rock/boulder layer**.  Geotech DPL/CPTu data should be used for
+the rock surface."""
 
 from __future__ import annotations
 
@@ -285,6 +301,25 @@ def analyse_pair(shot_a: ShotRecord, shot_b: ShotRecord) -> Optional[PMPairResul
     idx_a = idx_a[order]
     idx_b = idx_b[order]
 
+    # ── Between-shots geometric filter ─────────────────────────────
+    # The T⁺/T⁻ equations are only valid when the geophone sits
+    # between the two shots, so that BOTH shots can illuminate it
+    # with refracted (head-wave) energy.
+    margin = config.PM_SHOT_MARGIN
+    between = ((common_x > a.shot_pos + margin) &
+               (common_x < b.shot_pos - margin))
+    n_between = int(between.sum())
+    if n_between < config.PM_MIN_OVERLAP:
+        print(f"    ⚠  Only {n_between} geophones between shots "
+              f"[{a.shot_pos + margin:.1f}, {b.shot_pos - margin:.1f}] – skipped.")
+        return None
+    if n_between < len(common_x):
+        print(f"    Between-shots filter: {len(common_x)} → {n_between} geophones "
+              f"(x ∈ [{a.shot_pos + margin:.1f}, {b.shot_pos - margin:.1f}])")
+    common_x = common_x[between]
+    idx_a = idx_a[between]
+    idx_b = idx_b[between]
+
     t_a = a.times_ms[idx_a]   # T_Ai at common geophones (ms)
     t_b = b.times_ms[idx_b]   # T_Bi at common geophones (ms)
 
@@ -475,7 +510,7 @@ def analyse_transect_pm(files: list, tid: int) -> list[PMPairResult]:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Rock-depth collector (analogous to ITM's collect_rock_points)
+# Refractor-depth collector
 # ═══════════════════════════════════════════════════════════════════
 
 def collect_pm_rock_points(
@@ -483,10 +518,27 @@ def collect_pm_rock_points(
         elev_data: dict[int, tuple[np.ndarray, np.ndarray]],
 ) -> dict[int, list[dict]]:
     """
-    Convert PM depth profiles to absolute rock elevations per transect.
+    Convert PM depth profiles to absolute refractor elevations, applying
+    strict quality filters and aggregating overlapping estimates.
 
-    Returns dict  tid → list of {x_geo, z_surface, depth, z_rock, pair_label, v2}.
-    Multiple pairs may produce depths at the same geophone; all are kept.
+    **Important**: In a three-layer subsurface the PM two-layer analysis
+    detects the SHALLOWEST velocity contrast (V₂ ≈ 800–1000 m/s), which
+    is the compaction boundary or the base of loose fill — NOT the
+    rock/boulder layer (see module docstring).  The returned 'z_rock'
+    key is kept for backward compatibility but represents the
+    refractor elevation, not rock.
+
+    Filtering pipeline
+    ------------------
+    1. **Pair-level**: V₂ in [PM_V2_ACCEPT_MIN, PM_V2_ACCEPT_MAX],
+       T⁻ R² ≥ threshold, no refraction-zone fallback.
+    2. **Point-level**: depth in [PM_DEPTH_MIN, PM_DEPTH_MAX]
+       (relaxed near river).
+    3. **Aggregation**: median depth per x-bin (PM_AGG_BIN_WIDTH)
+       collapses the cloud of overlapping pairs into a single profile.
+
+    Returns dict  tid → list of
+        {x_geo, z_surface, depth, z_rock, n_pairs, v2_median}.
     """
     rock: dict[int, list[dict]] = {}
 
@@ -495,23 +547,170 @@ def collect_pm_rock_points(
             continue
         elev_x, elev_z = elev_data[tid]
 
+        # ── Collect individual (x, depth, v2) from accepted pairs ──
+        raw: list[tuple[float, float, float]] = []   # (x, depth, v2)
+        n_total = len(pair_list)
+        n_v2_ok = 0
+        n_r2_ok = 0
+        n_zone_ok = 0
+
         for pr in pair_list:
-            if np.all(np.isnan(pr.depths)):
+            if np.isnan(pr.v2):
                 continue
-            pair_label = f"{pr.file_a}↔{pr.file_b}"
+            # Pair-level: V₂ range
+            if not (config.PM_V2_ACCEPT_MIN <= pr.v2 <= config.PM_V2_ACCEPT_MAX):
+                continue
+            n_v2_ok += 1
+
+            # Pair-level: T⁻ R²
+            if pr.v2_r2 < config.PM_TMINUS_R2_MIN:
+                continue
+            n_r2_ok += 1
+
+            # Pair-level: genuine refraction zone (reject fallbacks)
+            if any('No refraction zone' in w for w in pr.warnings):
+                continue
+            n_zone_ok += 1
+
+            # Point-level: depth range (spatially aware)
             for x, d in zip(pr.geo_x, pr.depths):
                 if np.isnan(d) or d <= 0:
                     continue
-                z_surf = interpolate_elevation(elev_x, elev_z, float(x))
-                if z_surf is None:
+                # Minimum-depth filter
+                d_min = (config.PM_DEPTH_MIN_RIVER
+                         if x > config.PM_RIVER_X
+                         else config.PM_DEPTH_MIN)
+                if d < d_min or d > config.PM_DEPTH_MAX:
                     continue
-                rock.setdefault(tid, []).append(dict(
-                    x_geo=float(x),
-                    z_surface=z_surf,
-                    depth=float(d),
-                    z_rock=z_surf - float(d),
-                    pair_label=pair_label,
-                    v2=pr.v2,
-                ))
+                raw.append((float(x), float(d), float(pr.v2)))
+
+        if not raw:
+            print(f"  Transect {tid}: {n_total} PM pairs → "
+                  f"V₂ ok {n_v2_ok} → R² ok {n_r2_ok} → "
+                  f"zone ok {n_zone_ok} → 0 depth points after filtering")
+            continue
+
+        # ── Aggregate by x-position (median) ──────────────────────
+        xs  = np.array([p[0] for p in raw])
+        ds  = np.array([p[1] for p in raw])
+        v2s = np.array([p[2] for p in raw])
+
+        bin_w = config.PM_AGG_BIN_WIDTH
+        x_min = np.floor(xs.min() / bin_w) * bin_w
+        x_max = np.ceil(xs.max() / bin_w) * bin_w
+        bin_edges = np.arange(x_min, x_max + bin_w, bin_w)
+
+        tid_points: list[dict] = []
+        for i in range(len(bin_edges) - 1):
+            mask = (xs >= bin_edges[i]) & (xs < bin_edges[i + 1])
+            if mask.sum() == 0:
+                continue
+            xc      = float(0.5 * (bin_edges[i] + bin_edges[i + 1]))
+            med_d   = float(np.median(ds[mask]))
+            med_v2  = float(np.median(v2s[mask]))
+            n_pts   = int(mask.sum())
+
+            z_surf = interpolate_elevation(elev_x, elev_z, xc)
+            if z_surf is None:
+                continue
+
+            tid_points.append(dict(
+                x_geo=xc,
+                z_surface=z_surf,
+                depth=med_d,
+                z_rock=z_surf - med_d,
+                n_pairs=n_pts,
+                v2_median=med_v2,
+            ))
+
+        if tid_points:
+            tid_points.sort(key=lambda p: p['x_geo'])
+            rock[tid] = tid_points
+
+        print(f"  Transect {tid}: {n_total} PM pairs → "
+              f"V₂ ok {n_v2_ok} → R² ok {n_r2_ok} → "
+              f"zone ok {n_zone_ok} → {len(raw)} depth pts → "
+              f"{len(tid_points)} aggregated bins")
 
     return rock
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PM vs geotech comparison diagnostic
+# ═══════════════════════════════════════════════════════════════════
+
+def print_pm_geotech_comparison(
+        pm_by_tid: dict[int, list[dict]],
+        geotech_by_tid: dict,        # tid → list[GeotechPoint]
+) -> None:
+    """
+    Print a comparison table of PM refractor depths vs geotech rock
+    depths, highlighting the systematic three-layer offset.
+
+    This diagnostic helps verify that the PM detects the SHALLOW
+    refractor (compaction boundary) and NOT the deep rock/boulders
+    found by DPL/CPTu.
+    """
+    print("\n" + "=" * 72)
+    print("  PM REFRACTOR vs GEOTECH ROCK DEPTH — COMPARISON")
+    print("=" * 72)
+    print("  NOTE: PM detects the shallow refractor (V₂≈870 m/s),")
+    print("  which is the compaction boundary, NOT rock/boulders.")
+    print("  Expect PM depths ≈ 20–40% of geotech rock depths.")
+    print("-" * 72)
+
+    all_tids = sorted(set(list(pm_by_tid.keys()) +
+                          list(geotech_by_tid.keys())))
+    comparisons: list[tuple[float, float]] = []   # (pm_d, gt_d)
+
+    for tid in all_tids:
+        pm_pts = pm_by_tid.get(tid, [])
+        gt_pts = geotech_by_tid.get(tid, [])
+        if not pm_pts and not gt_pts:
+            continue
+
+        # Build geotech rock points: (x, rock_depth, test_type)
+        gt_rocks = []
+        for gp in gt_pts:
+            if gp.depth_of_rock is not None:
+                gt_rocks.append((gp.dist_x, gp.depth_of_rock, gp.test_type))
+
+        if not pm_pts:
+            continue      # nothing to compare
+
+        print(f"\n  Transect {tid}:")
+        for p in pm_pts:
+            # Find nearest geotech rock point
+            nearest = None
+            min_dx = 999.0
+            for x, rd, tt in gt_rocks:
+                dx = abs(x - p['x_geo'])
+                if dx < min_dx:
+                    min_dx = dx
+                    nearest = (x, rd, tt)
+            gt_str = ""
+            if nearest and min_dx < 4.0:
+                ratio = p['depth'] / nearest[1] if nearest[1] > 0 else 0
+                gt_str = (f"  ← {nearest[2]} @x={nearest[0]:.0f}: "
+                          f"rock={nearest[1]:.1f} m  "
+                          f"(PM/GT={ratio:.2f})")
+                comparisons.append((p['depth'], nearest[1]))
+            print(f"    x={p['x_geo']:5.1f}  "
+                  f"PM_refr={p['depth']:5.1f} m  "
+                  f"V₂={p.get('v2_median', 0):4.0f} m/s{gt_str}")
+
+    # Summary statistics
+    if comparisons:
+        ratios = [pm / gt for pm, gt in comparisons if gt > 0]
+        print(f"\n  {'─' * 60}")
+        print(f"  Matched points (PM within 4 m of geotech): {len(ratios)}")
+        if ratios:
+            print(f"  PM/Geotech ratio: "
+                  f"min={min(ratios):.2f}  "
+                  f"median={np.median(ratios):.2f}  "
+                  f"max={max(ratios):.2f}")
+            print(f"  → PM refractor is ~{np.median(ratios)*100:.0f}% "
+                  f"of geotech rock depth (three-layer effect).")
+    else:
+        print(f"\n  No co-located PM–geotech points for comparison.")
+    print("=" * 72)

@@ -18,3 +18,7 @@ wheels/
 *.csv
 *.pdf
 *.txt
+*.html
+*.png
+*.jpg
+*.PAM

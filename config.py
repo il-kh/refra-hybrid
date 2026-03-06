@@ -48,3 +48,17 @@ PM_V1_FOR_DEPTH     = V1_PRIOR   # V1 used in depth conversion (CPTu prior)
 PM_V2_FLOOR_FACTOR  = 1.4    # T⁻ zone must yield V₂ > V1 × this factor;
                               # otherwise it's the direct-wave zone, not
                               # the refracted zone
+
+# Plus-Minus quality filtering (applied in collect_pm_rock_points)
+# NOTE: The PM two-layer analysis detects the SHALLOWEST velocity
+# contrast ("shallow refractor"), which in a three-layer setting
+# is NOT the rock/boulder layer.  See analysis_plusminus docstring.
+PM_SHOT_MARGIN          = 1.0          # (m) margin inside shot positions for
+                                       # the "between-shots" geophone filter
+PM_V2_ACCEPT_MIN        = V2_ROCK_MIN  # pair V₂ must be ≥ this
+PM_V2_ACCEPT_MAX        = V2_MAX       # pair V₂ must be ≤ this
+PM_DEPTH_MIN            = 1.5          # (m) min plausible depth (landward)
+PM_DEPTH_MAX            = 16.0         # (m) max plausible depth
+PM_RIVER_X              = 18.0         # geophones at x > this are "near river"
+PM_DEPTH_MIN_RIVER      = 0.3          # (m) relaxed min depth near river
+PM_AGG_BIN_WIDTH        = 1.0          # (m) x-bin width for median aggregation

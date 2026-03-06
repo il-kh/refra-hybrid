@@ -41,7 +41,7 @@ from pathlib import Path
 import config
 from io_helpers import read_elev_csv, read_geotech_csv, read_vs_file, group_by_transect
 from analysis_itm import analyse_shot_itm
-from analysis_plusminus import analyse_transect_pm, collect_pm_rock_points
+from analysis_plusminus import analyse_transect_pm, collect_pm_rock_points, print_pm_geotech_comparison
 from plotting import save_traveltime_pdf, save_elevation_pdf, save_pm_traveltime_pdf
 from results import save_excel, save_pm_excel
 from config import DATA_DIR
@@ -95,6 +95,10 @@ def main() -> int:
             print(f"  ⚠  PM error on transect {tid}: {exc}")
 
     pm_rock_by_tid = collect_pm_rock_points(pm_results, elev_data)
+
+    # Diagnostic: compare PM refractor depths with geotech rock depths
+    if pm_rock_by_tid and geotech_by_tid:
+        print_pm_geotech_comparison(pm_rock_by_tid, geotech_by_tid)
 
     # ── Output ─────────────────────────────────────────────────────
     save_traveltime_pdf(all_records, script_dir / "refra_itm_traveltimes.pdf")
