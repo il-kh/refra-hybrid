@@ -196,45 +196,25 @@ def _draw_geotech_overlays(ax: plt.Axes,
 def _spline_segments(
         xs: np.ndarray,
         zs: np.ndarray,
-        barriers: set[float],
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """
-    Split (xs, zs) into curve segments at any barrier x-value that falls
-    strictly between two consecutive data points, then return (x_dense,
-    z_dense) pairs for each segment as a smooth interpolating curve.
+    Return a single smooth interpolating curve through all (xs, zs) points.
 
     Uses CubicSpline for ≥4 points, quadratic interp1d for exactly 3,
-    and linear interpolation for 2 points.
-    A barrier coinciding exactly with a data-point x-value does not split
-    the segment (the point is kept, but no curve crosses the barrier line).
+    and linear interpolation for 2 points.  Returns a list with one
+    (x_dense, z_dense) tuple (or empty list if fewer than 2 points).
     """
-    if len(xs) < 2:
+    n = len(xs)
+    if n < 2:
         return []
-
-    segments: list[list[tuple[float, float]]] = [[(xs[0], zs[0])]]
-    for i in range(1, len(xs)):
-        x_prev, x_cur = xs[i - 1], xs[i]
-        lo, hi = min(x_prev, x_cur), max(x_prev, x_cur)
-        if any(lo < b < hi for b in barriers):
-            segments.append([])          # barrier crossed – start new segment
-        segments[-1].append((xs[i], zs[i]))
-
-    results: list[tuple[np.ndarray, np.ndarray]] = []
-    for seg in segments:
-        if len(seg) < 2:
-            continue
-        sx = np.array([p[0] for p in seg])
-        sz = np.array([p[1] for p in seg])
-        x_dense = np.linspace(sx[0], sx[-1], 300)
-        n = len(seg)
-        if n >= 4:
-            z_dense = CubicSpline(sx, sz)(x_dense)
-        elif n == 3:
-            z_dense = interp1d(sx, sz, kind='quadratic')(x_dense)
-        else:                               # n == 2 → linear
-            z_dense = np.interp(x_dense, sx, sz)
-        results.append((x_dense, z_dense))
-    return results
+    x_dense = np.linspace(xs[0], xs[-1], 300)
+    if n >= 4:
+        z_dense = CubicSpline(xs, zs)(x_dense)
+    elif n == 3:
+        z_dense = interp1d(xs, zs, kind='quadratic')(x_dense)
+    else:                               # n == 2 → linear
+        z_dense = np.interp(x_dense, xs, zs)
+    return [(x_dense, z_dense)]
 
 
 def _draw_elevation_plot(ax: plt.Axes,
@@ -286,16 +266,20 @@ def _draw_elevation_plot(ax: plt.Axes,
                     color='saddlebrown', linewidth=1.2,
                     linestyle=':', alpha=0.6)   # dotted = extrapolated
 
-    # ── Barrier x-positions: geotech tests where NO rock was found ──────────────
-    # The connecting spline must not be drawn across these x-positions.
-    barriers: set[float] = {
-        pt.dist_x
-        for pt in (geotech_pts or [])
-        if pt.depth_of_rock is None
-    }
+    # ── Barrier x-positions: NO LONGER USED ─────────────────────────────────
+    # The spline is free to cross any geotech line.
+
+    # ── Collect all rock depth points for the combined spline ───────────────
+    # Geotech rock points (DPL / CPTu) converted to absolute z
+    geo_rock_pts: list[tuple[float, float]] = []
+    for pt in (geotech_pts or []):
+        if pt.depth_of_rock is None:
+            continue
+        z_surf = interpolate_elevation(x_plot, z_plot, pt.dist_x)
+        if z_surf is not None:
+            geo_rock_pts.append((pt.dist_x, z_surf - pt.depth_of_rock))
 
     # ── ITM rock-depth points ─────────────────────────────────────────────────
-    # Determine which sides are visible and what their depth/x thresholds are.
     _itm_cfg = {
         'right': (config.SHOW_ITM_RIGHT, config.ITM_RIGHT_DEPTH_MIN,
                   config.ITM_RIGHT_X_MIN, config.ITM_RIGHT_X_MAX),
@@ -313,8 +297,13 @@ def _draw_elevation_plot(ax: plt.Axes,
     if visible_itm:
         x_rock = np.array([p['x_geo']  for p in visible_itm])
         z_rock = np.array([p['z_rock'] for p in visible_itm])
-        # Spline connecting line, broken at any no-rock geotech barrier
-        for x_seg, z_seg in _spline_segments(x_rock, z_rock, barriers):
+        # Build combined point set: seismic ITM + geotech rock, sorted by x
+        combined = sorted(
+            [(p['x_geo'], p['z_rock']) for p in visible_itm] + geo_rock_pts
+        )
+        cx = np.array([p[0] for p in combined])
+        cz = np.array([p[1] for p in combined])
+        for x_seg, z_seg in _spline_segments(cx, cz):
             ax.plot(x_seg, z_seg,
                     color='dimgray', linestyle='--', linewidth=0.9,
                     alpha=0.6, zorder=3)
@@ -357,8 +346,13 @@ def _draw_elevation_plot(ax: plt.Axes,
         med_v2 = np.median([p.get('v2_median', 0) for p in pm_sorted])
         lbl = f'PM refractor (V\u2082\u2248{med_v2:.0f} m/s)'
 
-        # Spline connecting line, broken at any no-rock geotech barrier
-        for x_seg, z_seg in _spline_segments(x_pm, z_pm, barriers):
+        # Build combined point set: PM + geotech rock, sorted by x
+        combined_pm = sorted(
+            [(p['x_geo'], p['z_rock']) for p in pm_sorted] + geo_rock_pts
+        )
+        cpx = np.array([p[0] for p in combined_pm])
+        cpz = np.array([p[1] for p in combined_pm])
+        for x_seg, z_seg in _spline_segments(cpx, cpz):
             ax.plot(x_seg, z_seg,
                     color='purple', linestyle='-', linewidth=1.2,
                     alpha=0.7, zorder=3)
@@ -376,6 +370,19 @@ def _draw_elevation_plot(ax: plt.Axes,
     # Pass the full (possibly extrapolated) x/z arrays so that
     # interpolate_elevation works correctly for any x in [0, 28].
     _draw_geotech_overlays(ax, x_plot, z_plot, geotech_pts or [], sheetpile)
+
+    # ── Ground-water level ───────────────────────────────────────────────────
+    gwl_y = config.GWL_Y
+    if config.ELEV_Y_MIN <= gwl_y <= config.ELEV_Y_MAX:
+        ax.axhline(y=gwl_y, color='steelblue', linestyle='--',
+                   linewidth=1.4, zorder=4,
+                   label=f'GWL {gwl_y:.1f} m ASL ({config.GWL_DATE})')
+        ax.annotate(
+            f'GWL  {gwl_y:.1f} m ASL\n({config.GWL_DATE})',
+            xy=(config.ELEV_X_MIN, gwl_y),
+            xytext=(4, 3), textcoords='offset points',
+            fontsize=6, color='steelblue', clip_on=True,
+        )
 
     # ── Fixed 1:1 axes ────────────────────────────────────────────────────────
     ax.set_xlim(config.ELEV_X_MIN, config.ELEV_X_MAX)
