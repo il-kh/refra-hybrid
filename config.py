@@ -93,5 +93,5 @@ PM_REFRACTOR_X_MAX     = 24.0    # m – hide PM points right of this
 # Higher s → progressively smoother curve (residuals allowed).
 # Rule of thumb: s ≈ n   light smoothing (n = number of data points)
 #                s ≈ 4n  heavy smoothing
-ROCK_SPLINE_SMOOTHING  = 15.0     # m²  (sum-of-squared-residuals budget) 
+ROCK_SPLINE_SMOOTHING  = 25.0     # m²  (sum-of-squared-residuals budget) 
 

@@ -300,10 +300,27 @@ def _draw_elevation_plot(ax: plt.Axes,
     visible_itm = [p for p in sorted(rock_points or [], key=lambda p: p['x_geo'])
                    if _itm_visible(p)]
 
-    if visible_itm or geo_rock_pts:
-        # Build combined point set: seismic ITM + geotech rock, sorted by x
+    # ── PM refractor: filter first (needed for the combined spline) ─────────
+    # NOTE: this is the shallow refractor (V₂ ≈ 870 m/s), NOT rock.
+    # See analysis_plusminus module docstring for the three-layer explanation.
+    if pm_rock_points and config.SHOW_PM_REFRACTOR:
+        pm_sorted = [
+            p for p in sorted(pm_rock_points, key=lambda p: p['x_geo'])
+            if (p['depth'] >= config.PM_REFRACTOR_DEPTH_MIN
+                and config.PM_REFRACTOR_X_MIN <= p['x_geo'] <= config.PM_REFRACTOR_X_MAX)
+        ]
+        if not pm_sorted:
+            pm_sorted = None  # fall through to skip block
+    else:
+        pm_sorted = None
+
+    # ── Single combined spline: ITM + PM + geotech rock ─────────────────────
+    pm_pts_for_spline = [(p['x_geo'], p['z_rock']) for p in (pm_sorted or [])]
+    if visible_itm or geo_rock_pts or pm_pts_for_spline:
         combined = sorted(
-            [(p['x_geo'], p['z_rock']) for p in visible_itm] + geo_rock_pts
+            [(p['x_geo'], p['z_rock']) for p in visible_itm]
+            + geo_rock_pts
+            + pm_pts_for_spline
         )
         cx = np.array([p[0] for p in combined])
         cz = np.array([p[1] for p in combined])
@@ -312,6 +329,7 @@ def _draw_elevation_plot(ax: plt.Axes,
                     color='dimgray', linestyle='--', linewidth=0.9,
                     alpha=0.6, zorder=3)
 
+        # ITM scatter markers and depth annotations
         for side, color, label in (
                 ('right', 'steelblue', 'ITM rock (right wing)'),
                 ('left',  'darkgreen', 'ITM rock (left wing)'),
@@ -328,20 +346,7 @@ def _draw_elevation_plot(ax: plt.Axes,
                         xytext=(4, -10), textcoords='offset points',
                         fontsize=6.5, color='navy', clip_on=True)
 
-    # ── PM refractor points (triangles, median-aggregated) ──────────────────
-    # NOTE: this is the shallow refractor (V₂ ≈ 870 m/s), NOT rock.
-    # See analysis_plusminus module docstring for the three-layer explanation.
-    if pm_rock_points and config.SHOW_PM_REFRACTOR:
-        pm_sorted = [
-            p for p in sorted(pm_rock_points, key=lambda p: p['x_geo'])
-            if (p['depth'] >= config.PM_REFRACTOR_DEPTH_MIN
-                and config.PM_REFRACTOR_X_MIN <= p['x_geo'] <= config.PM_REFRACTOR_X_MAX)
-        ]
-        if not pm_sorted:
-            pm_sorted = None  # fall through to skip block
-    else:
-        pm_sorted = None
-
+    # ── PM refractor scatter markers and annotations ─────────────────────────
     if pm_sorted:
         x_pm = np.array([p['x_geo']  for p in pm_sorted])
         z_pm = np.array([p['z_rock'] for p in pm_sorted])
@@ -350,16 +355,6 @@ def _draw_elevation_plot(ax: plt.Axes,
         med_v2 = np.median([p.get('v2_median', 0) for p in pm_sorted])
         lbl = f'PM refractor (V\u2082\u2248{med_v2:.0f} m/s)'
 
-        # Build combined point set: PM + geotech rock, sorted by x
-        combined_pm = sorted(
-            [(p['x_geo'], p['z_rock']) for p in pm_sorted] + geo_rock_pts
-        )
-        cpx = np.array([p[0] for p in combined_pm])
-        cpz = np.array([p[1] for p in combined_pm])
-        for x_seg, z_seg in _smoothing_curve(cpx, cpz, config.ROCK_SPLINE_SMOOTHING):
-            ax.plot(x_seg, z_seg,
-                    color='purple', linestyle='-', linewidth=1.2,
-                    alpha=0.7, zorder=3)
         ax.scatter(x_pm, z_pm, color='darkorchid', marker='^',
                    s=65, zorder=5, edgecolors='indigo', linewidths=0.5,
                    label=lbl)
